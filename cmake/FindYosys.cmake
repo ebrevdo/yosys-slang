@@ -3,7 +3,7 @@ message(STATUS "Using yosys: ${YOSYS_CONFIG}")
 
 execute_process(
     COMMAND ${YOSYS_CONFIG} --bindir
-    OUTPUT_VARIABLE YOSYS_BINDIR 
+    OUTPUT_VARIABLE YOSYS_BINDIR
     OUTPUT_STRIP_TRAILING_WHITESPACE
     COMMAND_ERROR_IS_FATAL ANY
 )
@@ -25,6 +25,7 @@ execute_process(
 )
 string(REGEX REPLACE " +" ";" YOSYS_CXXFLAGS ${YOSYS_CXXFLAGS})
 list(FILTER YOSYS_CXXFLAGS INCLUDE REGEX "^-[ID]")
+list(FILTER YOSYS_CXXFLAGS EXCLUDE REGEX "^-DYOSYS_ENABLE_HELP_SOURCE(=|$)")
 message(STATUS "yosys-config --cxxflags (filtered): ${YOSYS_CXXFLAGS}")
 
 add_library(yosys::yosys INTERFACE IMPORTED)
