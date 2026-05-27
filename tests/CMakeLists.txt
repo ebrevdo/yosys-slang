@@ -29,6 +29,7 @@ set(ALL_TESTS
     unit/function_call.ys
     unit/latch.ys
     unit/selftests.tcl
+    unit/switchhelper_rank1_order.tcl
     various/assign_mixing.ys
     various/assignment_pattern_lhs.ys
     various/bb_detect.ys
