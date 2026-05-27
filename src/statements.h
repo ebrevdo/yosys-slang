@@ -134,7 +134,7 @@ struct SwitchHelper
 	using VariableState = ProceduralContext::VariableState;
 
 	VariableState &vstate;
-	VariableState::Map save_map;
+	VariableState::SaveState save_map;
 	std::vector<std::tuple<Case *, VariableBits, RTLIL::SigSpec>> branch_updates;
 	bool entered = false, finished = false;
 
@@ -208,12 +208,11 @@ struct SwitchHelper
 		// parent-scope value to merge into, so they do not get placeholders.
 		Yosys::pool<Variable> eos_variables;
 
-		auto &va = vstate.visible_assignments;
 		for (auto chunk : updated_chunks) {
 			if (chunk.variable.kind == Variable::Static)
 				continue;
 			for (uint64_t i = 0; i < chunk.bitwidth(); i++)
-				if (!va.count(chunk[i]))
+				if (!vstate.has_assignment(chunk[i]))
 					eos_variables.insert(chunk.variable);
 		}
 
@@ -224,7 +223,7 @@ struct SwitchHelper
 		for (auto chunk : updated_chunks) {
 			if (chunk.variable.kind != Variable::Static && eos_variables.count(chunk.variable)) {
 				for (uint64_t i = 0; i < chunk.bitwidth(); i++)
-					log_assert(!va.count(chunk[i]));
+					log_assert(!vstate.has_assignment(chunk[i]));
 
 				continue;
 			}
