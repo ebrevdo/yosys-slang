@@ -158,12 +158,15 @@ RTLIL::SigSpec AddressingResolver::extract<RTLIL::SigSpec>(RTLIL::SigSpec val, u
 	int64_t valsize = (int64_t)val.size();
 
 	RTLIL::SigSpec ret;
-	ret.append(RTLIL::SigSpec(RTLIL::Sx, (int)std::clamp<int64_t>(-offset * stride, 0, iwidth)));
+	RTLIL::SigSpec leading_pad(RTLIL::Sx, (int)std::clamp<int64_t>(-offset * stride, 0, iwidth));
+	ret.append(leading_pad);
 	int64_t start = std::clamp<int64_t>(offset * stride, 0, valsize);
 	int64_t end = std::clamp<int64_t>(offset * stride + iwidth, 0, valsize);
-	ret.append(val.extract((int)start, (int)(end - start)));
-	ret.append(RTLIL::SigSpec(
-			RTLIL::Sx, (int)std::clamp<int64_t>(iwidth - (-offset * stride + valsize), 0, iwidth)));
+	RTLIL::SigSpec extracted = val.extract((int)start, (int)(end - start));
+	ret.append(extracted);
+	RTLIL::SigSpec trailing_pad(
+			RTLIL::Sx, (int)std::clamp<int64_t>(iwidth - (-offset * stride + valsize), 0, iwidth));
+	ret.append(trailing_pad);
 	log_assert((int64_t)ret.size() == iwidth);
 
 	return ret;
@@ -276,6 +279,8 @@ RTLIL::SigSpec AddressingResolver::mux(RTLIL::SigSpec val, int output_len)
 {
 	log_assert(output_len == stride);
 	log_assert(val.size() % stride == 0);
+	if (raw_signal.is_fully_def())
+		return extract(val, output_len);
 	return raw_mux({RTLIL::SigSpec(RTLIL::Sx, std::max(0, base_offset * stride - val.size())), val,
 						   RTLIL::SigSpec(RTLIL::Sx, std::max(0, stride * -base_offset))},
 			-std::max(0, base_offset), std::max(0, -base_offset + val.size() / stride), output_len);
@@ -301,9 +306,9 @@ RTLIL::SigSpec AddressingResolver::shift_down_bitwise(RTLIL::SigSpec val, int ou
 
 RTLIL::SigSpec AddressingResolver::shift_down(RTLIL::SigSpec val, int output_len)
 {
-	if (raw_signal.is_fully_def()) {
+	if (raw_signal.is_fully_def())
 		return extract(val, output_len);
-	} else if (stride == 1) {
+	else if (stride == 1) {
 		return shift_down_bitwise(val, output_len);
 	} else {
 		RTLIL::SigSpec ret(RTLIL::Sm, output_len);

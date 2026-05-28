@@ -45,6 +45,11 @@ std::pair<std::string, SigSpec> RTLILBuilder::add_y_wire(int width)
 void RTLILBuilder::bless_cell(RTLIL::Cell *cell)
 {
 	cell->attributes = staged_attributes;
+	if (staged_source_range_valid && !cell->attributes.count(ID::src)) {
+		auto src = format_src(staged_source_range);
+		if (!src.empty())
+			cell->attributes[ID::src] = src;
+	}
 }
 
 SigSpec RTLILBuilder::ReduceBool(SigSpec a)
@@ -318,6 +323,27 @@ int convert(RTLIL::SigBit bit)
 }
 }; // namespace ThreeValued
 
+static SigSpec bitwise_identity_result(SigSpec sig)
+{
+	std::vector<int> z_offsets;
+	int offset = 0;
+
+	for (const RTLIL::SigChunk &chunk : sig.chunks()) {
+		if (!chunk.is_wire()) {
+			for (int i = 0; i < chunk.width; i++) {
+				if (chunk.data[i] == RTLIL::Sz)
+					z_offsets.push_back(offset + i);
+			}
+		}
+		offset += chunk.width;
+	}
+
+	for (int z_offset : z_offsets)
+		sig[z_offset] = RTLIL::Sx;
+
+	return sig;
+}
+
 SigSpec RTLILBuilder::Biop(
 		IdString op, SigSpec a, SigSpec b, bool a_signed, bool b_signed, int y_width)
 {
@@ -394,6 +420,40 @@ SigSpec RTLILBuilder::Biop(
 		}
 	}
 
+	if (op.in(ID($and), ID($or)) && a.size() == y_width && b.size() == y_width) {
+		if (a == b)
+			return bitwise_identity_result(a);
+
+		if (op == ID($and)) {
+			if (a.is_fully_zero() || b.is_fully_zero())
+				return SigSpec(RTLIL::S0, y_width);
+			if (a.is_fully_ones())
+				return bitwise_identity_result(b);
+			if (b.is_fully_ones())
+				return bitwise_identity_result(a);
+		} else {
+			if (a.is_fully_ones() || b.is_fully_ones())
+				return SigSpec(RTLIL::S1, y_width);
+			if (a.is_fully_zero())
+				return bitwise_identity_result(b);
+			if (b.is_fully_zero())
+				return bitwise_identity_result(a);
+		}
+	}
+
+	bool use_binary_cell_cache = op.in(ID($and), ID($or)) && y_width == 1 &&
+								 a.size() == 1 && b.size() == 1 &&
+								 !a_signed && !b_signed && staged_attributes.empty();
+	BinaryCellKey binary_cell_key;
+	if (use_binary_cell_cache) {
+		if (b < a)
+			std::swap(a, b);
+		binary_cell_key = {op, a, b, a_signed, b_signed, y_width};
+		auto cached = binary_cell_cache.find(binary_cell_key);
+		if (cached != binary_cell_cache.end())
+			return cached->second;
+	}
+
 	int msb_zeroes = 0;
 	if (op == ID($mul) && !a_signed && !b_signed) {
 		int as = a.size(), bs = b.size();
@@ -415,7 +475,10 @@ SigSpec RTLILBuilder::Biop(
 	cell->setParam(RTLIL::ID::Y_WIDTH, y_width - msb_zeroes);
 	cell->setPort(RTLIL::ID::Y, y);
 	bless_cell(cell);
-	return {SigSpec(RTLIL::S0, msb_zeroes), y};
+	SigSpec ret = {SigSpec(RTLIL::S0, msb_zeroes), y};
+	if (use_binary_cell_cache)
+		binary_cell_cache[binary_cell_key] = ret;
+	return ret;
 }
 
 SigSpec RTLILBuilder::Unop(IdString op, SigSpec a, bool a_signed, int y_width)
@@ -436,6 +499,16 @@ SigSpec RTLILBuilder::Unop(IdString op, SigSpec a, bool a_signed, int y_width)
 #undef OP
 	}
 
+	bool use_unary_cell_cache = op == ID($not) && y_width == 1 &&
+								a.size() == 1 && !a_signed && staged_attributes.empty();
+	UnaryCellKey unary_cell_key;
+	if (use_unary_cell_cache) {
+		unary_cell_key = {op, a, a_signed, y_width};
+		auto cached = unary_cell_cache.find(unary_cell_key);
+		if (cached != unary_cell_cache.end())
+			return cached->second;
+	}
+
 	auto [id, y] = add_y_wire(y_width);
 	Cell *cell = canvas->addCell(id, op);
 	cell->setPort(RTLIL::ID::A, a);
@@ -444,6 +517,8 @@ SigSpec RTLILBuilder::Unop(IdString op, SigSpec a, bool a_signed, int y_width)
 	cell->setParam(RTLIL::ID::Y_WIDTH, y_width);
 	cell->setPort(RTLIL::ID::Y, y);
 	bless_cell(cell);
+	if (use_unary_cell_cache)
+		unary_cell_cache[unary_cell_key] = y;
 	return y;
 }
 

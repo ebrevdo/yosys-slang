@@ -5,6 +5,11 @@
 // Distributed under the terms of the ISC license, see LICENSE
 //
 // clang-format off
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "slang/ast/ASTVisitor.h"
@@ -105,11 +110,9 @@ slang::SourceRange source_location(const ast::Expression &expr)		{ return expr.s
 slang::SourceRange source_location(const ast::Statement &stmt)		{ return stmt.sourceRange; }
 slang::SourceRange source_location(const ast::TimingControl &stmt)	{ return stmt.sourceRange; }
 
-template<typename T>
-std::string format_src(const T &obj)
+std::string format_src(slang::SourceRange sr)
 {
 	auto sm = global_sourcemgr;
-	auto sr = source_location(obj);
 
 	if (!sm->isFileLoc(sr.start()) || !sm->isFileLoc(sr.end()))
 		return "";
@@ -125,6 +128,12 @@ std::string format_src(const T &obj)
 			(int) sm->getLineNumber(sr.start()), (int) sm->getColumnNumber(sr.start()),
 			(int) sm->getLineNumber(sr.end()), (int) sm->getColumnNumber(sr.end()));
 	}
+}
+
+template<typename T>
+std::string format_src(const T &obj)
+{
+	return format_src(source_location(obj));
 }
 
 };
@@ -270,9 +279,7 @@ template void transfer_attrs<const ast::Symbol>(NetlistContext &netlist, const a
 template<typename T>
 void transfer_attrs(NetlistContext &netlist, T &from, AttributeGuard &guard)
 {
-	auto src = format_src(from);
-	if (!src.empty())
-		guard.set(ID::src, src);
+	guard.set_source(source_location(from));
 
 	for (auto attr : global_compilation->getAttributes(from)) {
 		if (auto value = convert_attr_value(netlist, attr)) {
@@ -1012,8 +1019,9 @@ RTLIL::SigSpec EvalContext::streaming(ast::StreamingConcatenationExpression cons
 
 	// SigSpec appends LSB-first; streams were evaluated left-to-right above,
 	// so append them in reverse to preserve SystemVerilog ordering.
-	for (auto part_it = parts.rbegin(); part_it != parts.rend(); ++part_it)
+	for (auto part_it = parts.rbegin(); part_it != parts.rend(); ++part_it) {
 		cat.append(*part_it);
+	}
 
 	require(expr, expr.getSliceSize() <= std::numeric_limits<int>::max());
 	int slice = expr.getSliceSize();
@@ -1022,11 +1030,14 @@ RTLIL::SigSpec EvalContext::streaming(ast::StreamingConcatenationExpression cons
 	} else {
 		RTLIL::SigSpec reorder;
 		std::vector<RTLIL::SigSpec> slices;
-		for (int i = 0; i < cat.size(); i += slice)
-			slices.push_back(cat.extract(i, std::min(slice, cat.size() - i)));
+		for (int i = 0; i < cat.size(); i += slice) {
+			RTLIL::SigSpec part = cat.extract(i, std::min(slice, cat.size() - i));
+			slices.push_back(part);
+		}
 		// Slice extraction also walks LSB-first, so rebuild in reverse order.
-		for (auto part_it = slices.rbegin(); part_it != slices.rend(); ++part_it)
+		for (auto part_it = slices.rbegin(); part_it != slices.rend(); ++part_it) {
 			reorder.append(*part_it);
+		}
 		return reorder;
 	}
 }
@@ -1517,8 +1528,9 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 			RTLIL::SigSpec hits;
 			require(inside_expr, inside_expr.left().type->isIntegral());
 
-			for (auto elem : inside_expr.rangeList())
+			for (auto elem : inside_expr.rangeList()) {
 				hits.append(inside_comparison(*this, left, *elem));
+			}
 
 			ret = netlist.ReduceBool(hits);
 			ret.extend_u0(expr.type->getBitstreamWidth());
@@ -1546,14 +1558,16 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				require(valsym, valsym.getInitializer());
 				auto exprconst = valsym.getInitializer()->eval(this->const_);
 				require(valsym, exprconst.isInteger());
-				return convert_svint(exprconst.integer());
+				ret = convert_svint(exprconst.integer());
+				goto done;
 			}
 
 			if (ast::ModportPortSymbol::isKind(symbol.kind) &&
 					!netlist.scopes_remap.count(symbol.getParentScope())) {
 				auto &modport_port = symbol.as<ast::ModportPortSymbol>();
 				ast_invariant(symbol, modport_port.getConnectionExpr() != nullptr);
-				return (*this)(*modport_port.getConnectionExpr());
+				ret = (*this)(*modport_port.getConnectionExpr());
+				goto done;
 			}
 
 			ast_invariant(symbol, ast::ValueSymbol::isKind(symbol.kind));
@@ -1645,13 +1659,14 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				if (!right.is_fully_const()) {
 					netlist.add_diag(diag::NonconstWildcardEq, expr.sourceRange);
 					ret = netlist.add_placeholder_signal(expr.type->getBitstreamWidth());
-					return ret;
+					goto done;
 				}
-				return netlist.Unop(
+				ret = netlist.Unop(
 					invert ? ID($logic_not) : ID($reduce_bool),
 					netlist.EqWildcard(left, right),
 					false, expr.type->getBitstreamWidth()
 				);
+				goto done;
 			default:
 				break;
 			}
@@ -1785,12 +1800,14 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 			auto operands = concat.operands();
 			std::vector<RTLIL::SigSpec> parts;
 			parts.reserve(operands.size());
-			for (auto op : operands)
+			for (auto op : operands) {
 				parts.push_back((*this)(*op));
+			}
 			// SigSpec appends LSB-first; operands are evaluated in source order
 			// above and appended in reverse to preserve concatenation order.
-			for (auto part_it = parts.rbegin(); part_it != parts.rend(); ++part_it)
+			for (auto part_it = parts.rbegin(); part_it != parts.rend(); ++part_it) {
 				ret.append(*part_it);
+			}
 		}
 		break;
 	case ast::ExpressionKind::SimpleAssignmentPattern:
@@ -1813,8 +1830,9 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 			for (auto elem : elements)
 				parts.push_back((*this)(*elem));
 			// Assignment patterns use the same bit ordering as concatenations.
-			for (auto part_it = parts.rbegin(); part_it != parts.rend(); ++part_it)
+			for (auto part_it = parts.rbegin(); part_it != parts.rend(); ++part_it) {
 				ret.append(*part_it);
+			}
 			ret = ret.repeat(repl_count);
 		}
 		break;
@@ -1839,8 +1857,9 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 			ast_invariant(expr, count.isInteger());
 			int reps = count.integer().as<int>().value(); // TODO: checking int cast
 			RTLIL::SigSpec concat = (*this)(repl.concat());
-			for (int i = 0; i < reps; i++)
+			for (int i = 0; i < reps; i++) {
 				ret.append(concat);
+			}
 		}
 		break;
 	case ast::ExpressionKind::MemberAccess:
@@ -3560,7 +3579,6 @@ const RTLIL::SigSpec& NetlistContext::wire(const ast::Symbol &symbol)
 RTLIL::SigSpec NetlistContext::convert_static(VariableBits bits)
 {
 	RTLIL::SigSpec ret;
-
 	for (auto vchunk : bits.chunks()) {
 		switch (vchunk.variable.kind) {
 		case Variable::Static:
