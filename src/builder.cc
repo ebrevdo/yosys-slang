@@ -15,6 +15,8 @@ using RTLIL::Cell;
 using RTLIL::IdString;
 using RTLIL::SigSpec;
 
+static constexpr int wide_unary_cache_max_width = 64;
+
 // A compat util to be removed once we drop 0.59 support
 #if YOSYS_MAJOR == 0 && YOSYS_MINOR < 59
 static IdString id(std::string_view sv)
@@ -441,9 +443,11 @@ SigSpec RTLILBuilder::Biop(
 		}
 	}
 
-	bool use_binary_cell_cache = op.in(ID($and), ID($or)) && y_width == 1 &&
-								 a.size() == 1 && b.size() == 1 &&
-								 !a_signed && !b_signed && staged_attributes.empty();
+	bool use_binary_cell_cache = false;
+	if (op.in(ID($and), ID($or)) && y_width == 1 && a.size() == 1 && b.size() == 1) {
+		if (!a_signed && !b_signed && staged_attributes.empty())
+			use_binary_cell_cache = true;
+	}
 	BinaryCellKey binary_cell_key;
 	if (use_binary_cell_cache) {
 		if (b < a)
@@ -499,14 +503,30 @@ SigSpec RTLILBuilder::Unop(IdString op, SigSpec a, bool a_signed, int y_width)
 #undef OP
 	}
 
-	bool use_unary_cell_cache = op == ID($not) && y_width == 1 &&
-								a.size() == 1 && !a_signed && staged_attributes.empty();
+	bool is_not_op = op == ID($not);
+	bool use_unary_cell_cache = false;
+	bool use_legacy_unary_cell_cache = false;
+	bool use_wide_unary_cell_cache = false;
+	if (is_not_op && y_width > 0 && y_width <= wide_unary_cache_max_width &&
+			a.size() == y_width && !a_signed && staged_attributes.empty()) {
+		use_unary_cell_cache = true;
+		if (y_width == 1)
+			use_legacy_unary_cell_cache = true;
+		else
+			use_wide_unary_cell_cache = true;
+	}
 	UnaryCellKey unary_cell_key;
 	if (use_unary_cell_cache) {
-		unary_cell_key = {op, a, a_signed, y_width};
-		auto cached = unary_cell_cache.find(unary_cell_key);
-		if (cached != unary_cell_cache.end())
-			return cached->second;
+		if (use_legacy_unary_cell_cache) {
+			unary_cell_key = {op, a, a_signed, y_width};
+			auto cached = unary_cell_cache.find(unary_cell_key);
+			if (cached != unary_cell_cache.end())
+				return cached->second;
+		} else {
+			auto cached = wide_unary_cell_cache.find(a);
+			if (cached != wide_unary_cell_cache.end())
+				return cached->second;
+		}
 	}
 
 	auto [id, y] = add_y_wire(y_width);
@@ -517,8 +537,13 @@ SigSpec RTLILBuilder::Unop(IdString op, SigSpec a, bool a_signed, int y_width)
 	cell->setParam(RTLIL::ID::Y_WIDTH, y_width);
 	cell->setPort(RTLIL::ID::Y, y);
 	bless_cell(cell);
-	if (use_unary_cell_cache)
-		unary_cell_cache[unary_cell_key] = y;
+	if (use_unary_cell_cache) {
+		if (use_legacy_unary_cell_cache) {
+			unary_cell_cache[unary_cell_key] = y;
+		} else if (use_wide_unary_cell_cache) {
+			wide_unary_cell_cache[a] = y;
+		}
+	}
 	return y;
 }
 

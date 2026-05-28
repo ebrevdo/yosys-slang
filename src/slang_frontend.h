@@ -20,6 +20,7 @@
 
 template<> struct Yosys::hashlib::hash_ops<const slang::ast::Symbol*> : Yosys::hashlib::hash_ptr_ops {};
 template<> struct Yosys::hashlib::hash_ops<const slang::ast::Scope*> : Yosys::hashlib::hash_ptr_ops {};
+template<> struct Yosys::hashlib::hash_ops<const slang::ast::Expression*> : Yosys::hashlib::hash_ptr_ops {};
 template<> struct Yosys::hashlib::hash_ops<void*> : Yosys::hashlib::hash_ptr_ops {};
 
 namespace slang {
@@ -142,6 +143,7 @@ struct EvalContext {
 
 	RTLIL::SigSpec apply_conversion(const ast::ConversionExpression &conv, RTLIL::SigSpec op);
 	RTLIL::SigSpec apply_nested_conversion(const ast::Expression &expr, RTLIL::SigSpec val);
+	std::optional<RTLIL::SigSpec> static_rvalue_signal(ast::Expression const &expr);
 	VariableBits streaming_lhs(ast::StreamingConcatenationExpression const &expr);
 	RTLIL::SigSpec streaming(ast::StreamingConcatenationExpression const &expr);
 
@@ -419,10 +421,12 @@ struct RTLILBuilder {
 	// cell; many expression leaves never need an `src` string.
 	slang::SourceRange staged_source_range;
 	bool staged_source_range_valid = false;
-	// Source-only one-bit expression CSE. These caches are used only when no
-	// staged user attributes would be lost by reusing an existing cell result.
+	// Source-only expression CSE is used only when no staged user attributes
+	// would be lost. The wider unary cache is separate so it cannot evict the
+	// original high-hit one-bit working set.
 	Yosys::dict<BinaryCellKey, SigSpec> binary_cell_cache;
 	Yosys::dict<UnaryCellKey, SigSpec> unary_cell_cache;
+	Yosys::dict<SigSpec, SigSpec> wide_unary_cell_cache;
 
 	unsigned next_id = 0;
 	std::string new_id(std::string base = std::string());
@@ -611,6 +615,37 @@ struct NetlistContext : RTLILBuilder, public DiagnosticIssuer {
 	const RTLIL::SigSpec& add_wire(const ast::ValueSymbol &sym);
 	const RTLIL::SigSpec& wire(const ast::Symbol &sym);
 	RTLIL::SigSpec convert_static(VariableBits bits);
+
+	struct StaticRvalueCacheEntry {
+		RTLIL::SigSpec signal;
+		uint64_t cost = 0;
+	};
+
+	struct StaticChunkCacheKey {
+		Variable variable;
+		uint64_t base = 0;
+		uint64_t length = 0;
+
+		bool operator==(const StaticChunkCacheKey &other) const
+		{
+			return variable == other.variable && base == other.base && length == other.length;
+		}
+
+		[[nodiscard]] Yosys::Hasher hash_into(Yosys::Hasher h) const
+		{
+			h.eat(variable);
+			h.eat(base);
+			h.eat(length);
+			return h;
+		}
+	};
+
+	// Cache successful static RHS expression analyses after all shape checks.
+	Yosys::dict<const ast::Expression*, StaticRvalueCacheEntry> static_rvalue_cache;
+	uint64_t static_rvalue_cache_cost = 0;
+	// Cache bounded repeated static wire slices used by convert_static().
+	Yosys::dict<StaticChunkCacheKey, RTLIL::SigSpec> static_chunk_cache;
+	uint64_t static_chunk_cache_cost = 0;
 
 	struct Memory {
 		int num_wr_ports = 0;
