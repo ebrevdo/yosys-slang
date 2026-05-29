@@ -755,6 +755,11 @@ public:
 
 	RTLIL::SigSpec shift_up(RTLIL::SigSpec val, bool oor_undef, int output_len);
 	RTLIL::SigSpec demux(RTLIL::SigSpec val, int output_len);
+	// Like demux(), but returns only the mask bits for zero-based elements
+	// [first_element, first_element + element_count). The input val is one
+	// element wide, and the result is element_count elements wide.
+	RTLIL::SigSpec demux_window(
+			RTLIL::SigSpec val, uint64_t first_element, uint64_t element_count);
 	RTLIL::SigSpec mux(RTLIL::SigSpec val, int output_len);
 	RTLIL::SigSpec shift_down(RTLIL::SigSpec val, int output_len);
 	template <typename Bundle> Bundle extract(Bundle val, uint64_t width);
@@ -769,6 +774,8 @@ private:
 	RTLIL::SigSpec shift_up_bitwise(RTLIL::SigSpec val, bool oor_undef, int output_len);
 	RTLIL::SigSpec shift_down_bitwise(RTLIL::SigSpec val, int output_len);
 	RTLIL::SigSpec raw_demux(RTLIL::SigSpec val, int from, int to);
+	RTLIL::SigSpec guard_for_element(uint64_t element_index);
+	RTLIL::SigSpec guards_for_element_window(uint64_t first_element, uint64_t element_count);
 	RTLIL::SigSpec raw_mux(RTLIL::SigSpec val, int from, int to, int stride);
 	RTLIL::SigSpec embed(RTLIL::SigSpec val, int output_len, int stride, RTLIL::State padding);
 

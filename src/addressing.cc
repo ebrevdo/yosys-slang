@@ -16,7 +16,31 @@
 #include "slang_frontend.h"
 #include "variables.h"
 
+#include <limits>
+
 namespace slang_frontend {
+
+static int64_t min_signed_value_for_width(int width)
+{
+	log_assert(width > 0);
+	if (width >= 63)
+		return std::numeric_limits<int64_t>::min();
+	return -(1ll << (width - 1));
+}
+
+static int64_t max_signed_value_for_width(int width)
+{
+	log_assert(width > 0);
+	if (width >= 63)
+		return std::numeric_limits<int64_t>::max();
+	return (1ll << (width - 1)) - 1;
+}
+
+static bool raw_index_fits_signal_width(int64_t value, int width)
+{
+	return value >= min_signed_value_for_width(width) &&
+		value <= max_signed_value_for_width(width);
+}
 
 void AddressingResolver::interpret_index(RTLIL::SigSpec signal, int width_down, int width_up)
 {
@@ -228,6 +252,91 @@ RTLIL::SigSpec AddressingResolver::demux(RTLIL::SigSpec val, int output_len)
 			val, -std::max(0, base_offset), std::max(0, output_len / stride - base_offset));
 
 	return demuxed.extract(std::max(0, -stride * base_offset), output_len);
+}
+
+RTLIL::SigSpec AddressingResolver::guard_for_element(uint64_t element_index)
+{
+	if (element_index > (uint64_t)std::numeric_limits<int64_t>::max())
+		return RTLIL::SigSpec(RTLIL::S0);
+
+	int64_t raw_index = (int64_t)element_index - base_offset;
+	if (!raw_index_fits_signal_width(raw_index, raw_signal.size()))
+		return RTLIL::SigSpec(RTLIL::S0);
+
+	RTLIL::SigSpec expected(RTLIL::Const(raw_index, raw_signal.size()));
+	return netlist.Eq(raw_signal, expected);
+}
+
+RTLIL::SigSpec AddressingResolver::guards_for_element_window(
+		uint64_t first_element, uint64_t element_count)
+{
+	log_assert(element_count > 0);
+	log_assert(element_count < (1u << 23));
+	if (element_count == 1)
+		return guard_for_element(first_element);
+
+	int raw_width = raw_signal.size();
+	__int128 requested_first = (__int128)first_element - base_offset;
+	__int128 requested_last = requested_first + element_count - 1;
+	__int128 min_raw = min_signed_value_for_width(raw_width);
+	__int128 max_raw = max_signed_value_for_width(raw_width);
+	// Clip the requested zero-based element window to raw selector values that
+	// are representable in raw_signal's signed width. Prefix and suffix padding
+	// preserve the caller's requested element positions.
+	__int128 valid_first = std::max(requested_first, min_raw);
+	__int128 valid_last = std::min(requested_last, max_raw);
+	if (valid_first > valid_last)
+		return RTLIL::SigSpec(RTLIL::S0, element_count);
+
+	uint64_t prefix_zeros = (uint64_t)(valid_first - requested_first);
+	uint64_t valid_count = (uint64_t)(valid_last - valid_first + 1);
+	uint64_t suffix_zeros = element_count - prefix_zeros - valid_count;
+
+	if (valid_count == 1) {
+		RTLIL::SigSpec guards;
+		guards.append(RTLIL::SigSpec(RTLIL::S0, prefix_zeros));
+		guards.append(guard_for_element(first_element + prefix_zeros));
+		guards.append(RTLIL::SigSpec(RTLIL::S0, suffix_zeros));
+		return guards;
+	}
+
+	int demux_width = std::bit_ceil((unsigned int)valid_count);
+	int select_width = ceil_log2(demux_width);
+	int relative_width = std::max(raw_width + 1, select_width + 1);
+
+	// Demux a relative nonnegative selector. The upper bits check keeps the
+	// demux active only for relative values in the clipped valid window.
+	RTLIL::SigSpec first_const(RTLIL::Const((int64_t)valid_first, raw_width));
+	RTLIL::SigSpec relative = netlist.Biop(
+			ID($sub), raw_signal, first_const, true, true, relative_width);
+	RTLIL::SigSpec in_range = netlist.Eq(
+			relative.extract(select_width, relative_width - select_width),
+			RTLIL::SigSpec(RTLIL::S0, relative_width - select_width));
+	RTLIL::SigSpec guards;
+	guards.append(RTLIL::SigSpec(RTLIL::S0, prefix_zeros));
+	guards.append(netlist.Demux(in_range, relative.extract(0, select_width)).extract(0, valid_count));
+	guards.append(RTLIL::SigSpec(RTLIL::S0, suffix_zeros));
+	return guards;
+}
+
+RTLIL::SigSpec AddressingResolver::demux_window(
+		RTLIL::SigSpec val, uint64_t first_element, uint64_t element_count)
+{
+	log_assert(val.size() == stride);
+	log_assert(element_count > 0);
+
+	RTLIL::SigSpec guards = guards_for_element_window(first_element, element_count);
+	RTLIL::SigSpec bit_guards;
+	for (uint64_t i = 0; i < element_count; i++)
+		bit_guards.append(RTLIL::SigSpec(guards[(int)i], stride));
+
+	if (val.is_fully_zero())
+		return RTLIL::SigSpec(RTLIL::S0, bit_guards.size());
+	if (val.is_fully_ones())
+		return bit_guards;
+
+	return netlist.Bwmux(RTLIL::SigSpec(RTLIL::S0, bit_guards.size()),
+			val.repeat(element_count), bit_guards);
 }
 
 RTLIL::SigSpec AddressingResolver::raw_mux(RTLIL::SigSpec val, int from, int to, int stride)
