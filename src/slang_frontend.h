@@ -18,7 +18,6 @@
 
 template<> struct Yosys::hashlib::hash_ops<const slang::ast::Symbol*> : Yosys::hashlib::hash_ptr_ops {};
 template<> struct Yosys::hashlib::hash_ops<const slang::ast::Scope*> : Yosys::hashlib::hash_ptr_ops {};
-template<> struct Yosys::hashlib::hash_ops<const slang::ast::Expression*> : Yosys::hashlib::hash_ptr_ops {};
 template<> struct Yosys::hashlib::hash_ops<void*> : Yosys::hashlib::hash_ptr_ops {};
 
 namespace slang {
@@ -141,7 +140,6 @@ struct EvalContext {
 
 	RTLIL::SigSpec apply_conversion(const ast::ConversionExpression &conv, RTLIL::SigSpec op);
 	RTLIL::SigSpec apply_nested_conversion(const ast::Expression &expr, RTLIL::SigSpec val);
-	std::optional<RTLIL::SigSpec> static_rvalue_signal(ast::Expression const &expr);
 	VariableBits streaming_lhs(ast::StreamingConcatenationExpression const &expr);
 	RTLIL::SigSpec streaming(ast::StreamingConcatenationExpression const &expr);
 
@@ -298,40 +296,32 @@ private:
 
 public:
 	struct VariableState {
-		// Procedural assignments are stored as sorted, non-overlapping
-		// per-variable segments. Branch save/restore uses the same structure
-		// to log the first parent value seen for each touched segment.
-		// Undo segments use Sm bits to mark positions that had no assignment
-		// and should be erased when the saved state is restored.
-		struct Segment {
-			uint64_t base;
-			RTLIL::SigSpec value;
+		// Assignments are an append-only log; materialized values cache hot variables.
+		// Branch save points are log indices, so restoring a branch only drops its suffix.
+		struct AssignmentJournal {
+			struct Entry {
+				Variable variable;
+				uint64_t base;
+				RTLIL::SigSpec value;
+			};
+			std::vector<Entry> entries;
+			Yosys::dict<Variable, RTLIL::SigSpec> materialized;
 
-			uint64_t end() const { return base + value.size(); }
-			uint64_t bitwidth() const { return value.size(); }
+			std::optional<RTLIL::SigBit> find(const VariableBit &bit) const;
+			void assign(VariableChunk chunk, RTLIL::SigSpec value);
 		};
-
-		struct SegmentStore {
-			Yosys::dict<Variable, std::vector<Segment>> by_variable;
-
-			void clear() { by_variable.clear(); }
-			void swap(SegmentStore &other) { by_variable.swap(other.by_variable); }
-		};
-
-		using SaveState = SegmentStore;
-
-		SegmentStore visible_assignments;
-		SaveState revert;
+		AssignmentJournal visible_assignments;
+		enum class Checkpoint : size_t {};
+		size_t branch_start = 0;
 
 		void set(VariableBits lhs, RTLIL::SigSpec value);
 		RTLIL::SigSpec evaluate(NetlistContext &netlist, VariableBits vbits);
 		RTLIL::SigSpec evaluate(NetlistContext &netlist, VariableChunk vchunk);
-		void save(SaveState &save);
-		std::pair<VariableBits, RTLIL::SigSpec> restore(SaveState &save);
-		bool has_assignment(VariableBit bit) const;
-		bool has_overlap(VariableChunk chunk) const;
-		RTLIL::SigBit assignment(VariableBit bit) const;
-		std::vector<VariableChunk> assigned_chunks() const;
+		Checkpoint checkpoint()
+		{
+			return Checkpoint(std::exchange(branch_start, visible_assignments.entries.size()));
+		}
+		std::pair<VariableBits, RTLIL::SigSpec> rollback(Checkpoint checkpoint);
 	};
 
 	VariableState vstate;
@@ -363,54 +353,19 @@ private:
 
 struct RTLILBuilder {
 	using SigSpec = RTLIL::SigSpec;
-
-	struct BinaryCellKey {
-		RTLIL::IdString op;
-		SigSpec a;
-		SigSpec b;
-		bool a_signed = false;
-		bool b_signed = false;
-		int y_width = 0;
-
-		bool operator==(const BinaryCellKey &other) const
-		{
-			return op == other.op && a == other.a && b == other.b &&
-				   a_signed == other.a_signed && b_signed == other.b_signed &&
-				   y_width == other.y_width;
-		}
-
-		[[nodiscard]] Yosys::Hasher hash_into(Yosys::Hasher h) const
-		{
-			h.eat(op);
-			h.eat(a);
-			h.eat(b);
-			h.eat(a_signed);
-			h.eat(b_signed);
-			h.eat(y_width);
-			return h;
-		}
+	// Wire keys use nonempty names and nonnegative offsets; constants use an
+	// empty name and negative state encodings, so the domains cannot collide.
+	using BitKey = std::pair<RTLIL::IdString, int>;
+	static constexpr auto bit_key = [](RTLIL::SigBit bit) {
+		return BitKey(bit.wire ? bit.wire->name : RTLIL::IdString(),
+				bit.wire ? bit.offset : -1 - int(bit.data));
 	};
-
-	struct UnaryCellKey {
-		RTLIL::IdString op;
-		SigSpec a;
-		bool a_signed = false;
-		int y_width = 0;
-
-		bool operator==(const UnaryCellKey &other) const
-		{
-			return op == other.op && a == other.a &&
-				   a_signed == other.a_signed && y_width == other.y_width;
-		}
-
-		[[nodiscard]] Yosys::Hasher hash_into(Yosys::Hasher h) const
-		{
-			h.eat(op);
-			h.eat(a);
-			h.eat(a_signed);
-			h.eat(y_width);
-			return h;
-		}
+	// Same-source scalar operations fill one eight-bit cell; a final partial batch is zero-padded.
+	struct BinaryCellBatch {
+		RTLIL::IdString id;
+		slang::SourceRange source;
+		SigSpec a, b;
+		int y_offset, used = 8;
 	};
 
 	RTLIL::Module *canvas;
@@ -419,23 +374,21 @@ struct RTLILBuilder {
 	// cell; many expression leaves never need an `src` string.
 	slang::SourceRange staged_source_range;
 	bool staged_source_range_valid = false;
-	// Source-only expression CSE is used only when no staged user attributes
-	// would be lost. The wider unary cache is separate so it cannot evict the
-	// original high-hit one-bit working set.
-	Yosys::dict<BinaryCellKey, SigSpec> binary_cell_cache;
-	Yosys::dict<UnaryCellKey, SigSpec> unary_cell_cache;
-	Yosys::dict<SigSpec, SigSpec> wide_unary_cell_cache;
+	// Share source-only one-bit boolean cells without dropping user attributes.
+	// Operation-keyed lanes cache AND, OR, NOT, XOR, and XNOR cells.
+	Yosys::dict<RTLIL::IdString, Yosys::dict<std::pair<BitKey, BitKey>, int>>
+		binary_cell_cache;
+	Yosys::dict<std::tuple<RTLIL::IdString, uint32_t, uint64_t, uint64_t>, BinaryCellBatch>
+		binary_cell_batches;
+	RTLIL::Wire *generated_y = nullptr;
 
 	unsigned next_id = 0;
 	std::string new_id(std::string base = std::string());
+	void finish_binary_cell_batch(RTLIL::IdString op, BinaryCellBatch &batch);
 
 	SigSpec ReduceBool(SigSpec a);
 
 	SigSpec Demux(SigSpec a, SigSpec s);
-	// Return only the contiguous branch window
-	// [first_branch, first_branch + branch_count) from a demux.
-	SigSpec DemuxWindow(SigSpec a, SigSpec s, int64_t first_branch, uint64_t branch_count,
-			bool s_signed=false);
 	SigSpec Le(SigSpec a, SigSpec b, bool is_signed);
 	SigSpec Ge(SigSpec a, SigSpec b, bool is_signed);
 	SigSpec Lt(SigSpec a, SigSpec b, bool is_signed);
@@ -618,10 +571,6 @@ struct NetlistContext : RTLILBuilder, public DiagnosticIssuer {
 	const RTLIL::SigSpec& wire(const ast::Symbol &sym);
 	RTLIL::SigSpec convert_static(VariableBits bits);
 
-	// Cache successful static RHS expression analyses after all shape checks.
-	Yosys::dict<const ast::Expression*, RTLIL::SigSpec> static_rvalue_cache;
-	uint64_t static_rvalue_cache_cost = 0;
-
 	struct Memory {
 		int num_wr_ports = 0;
 	};
@@ -632,7 +581,6 @@ struct NetlistContext : RTLILBuilder, public DiagnosticIssuer {
 
 	// Cache per-symbol SigSpec
 	Yosys::dict<const ast::Symbol*, RTLIL::SigSpec> wire_cache;
-
 	Yosys::pool<VariableBit> driven_variables;
 
 	// Driven by a register, including a latch
@@ -681,7 +629,6 @@ struct NetlistContext : RTLILBuilder, public DiagnosticIssuer {
 	void add_continuous_driver(VariableBits lhs, RTLIL::SigSpec rhs);
 
 	const std::optional<RTLIL::Const> convert_const(const slang::ConstantValue &constval, slang::SourceLocation loc);
-
 };
 
 // slang_frontend.cc
@@ -730,11 +677,6 @@ public:
 
 	RTLIL::SigSpec shift_up(RTLIL::SigSpec val, bool oor_undef, int output_len);
 	RTLIL::SigSpec demux(RTLIL::SigSpec val, int output_len);
-	// Like demux(), but returns only the mask bits for zero-based elements
-	// [first_element, first_element + element_count). The input val is one
-	// element wide, and the result is element_count elements wide.
-	RTLIL::SigSpec demux_window(
-			RTLIL::SigSpec val, uint64_t first_element, uint64_t element_count);
 	RTLIL::SigSpec mux(RTLIL::SigSpec val, int output_len);
 	RTLIL::SigSpec shift_down(RTLIL::SigSpec val, int output_len);
 	template <typename Bundle> Bundle extract(Bundle val, uint64_t width);

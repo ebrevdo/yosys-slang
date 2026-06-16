@@ -5,7 +5,6 @@
 // Distributed under the terms of the ISC license, see LICENSE
 //
 // clang-format off
-#include <algorithm>
 #include <vector>
 
 #include "slang/ast/ASTVisitor.h"
@@ -100,9 +99,6 @@ namespace parsing = slang::parsing;
 
 ast::Compilation *global_compilation;
 const slang::SourceManager *global_sourcemgr;
-
-static constexpr size_t static_rvalue_cache_max_entries = 65536;
-static constexpr uint64_t static_rvalue_cache_max_cost = 4 * 1024 * 1024;
 
 slang::SourceRange source_location(const ast::Symbol &obj)			{ return slang::SourceRange(obj.location, obj.location); }
 slang::SourceRange source_location(const ast::Expression &expr)		{ return expr.sourceRange; }
@@ -465,379 +461,73 @@ const ast::InstanceBodySymbol &get_instance_body(SynthesisSettings &settings, co
 }
 
 using VariableState = ProceduralContext::VariableState;
-using StateSegment = VariableState::Segment;
-using StateSegmentStore = VariableState::SegmentStore;
 
-// Segment helpers maintain sorted, non-overlapping per-variable ranges.
-// append_segment() also coalesces adjacent ranges after callers split or
-// overwrite existing segments.
-static void append_segment(std::vector<StateSegment> &segments, StateSegment segment)
+std::optional<RTLIL::SigBit> VariableState::AssignmentJournal::find(const VariableBit &bit) const
 {
-	if (segment.bitwidth() == 0)
-		return;
-
-	if (!segments.empty() && segments.back().end() == segment.base) {
-		segments.back().value.append(segment.value);
-		return;
-	}
-
-	log_assert(segments.empty() || segments.back().end() < segment.base);
-	segments.push_back(segment);
+	for (auto entry = entries.rbegin(); entry != entries.rend(); entry++)
+		if (entry->variable == bit.variable && bit.offset >= entry->base &&
+				bit.offset < entry->base + entry->value.size())
+			return entry->value[bit.offset - entry->base];
+	return {};
 }
 
-static std::vector<StateSegment>::const_iterator first_possible_segment(
-		const std::vector<StateSegment> &segments, uint64_t base)
+void VariableState::AssignmentJournal::assign(VariableChunk chunk, RTLIL::SigSpec value)
 {
-	return std::lower_bound(segments.begin(), segments.end(), base,
-			[](const StateSegment &segment, uint64_t value) { return segment.end() <= value; });
-}
-
-static void set_segment(std::vector<StateSegment> &segments, uint64_t base, RTLIL::SigSpec value)
-{
-	if (value.empty())
-		return;
-
-	uint64_t end = base + value.size();
-
-	if (segments.empty() || segments.back().end() <= base) {
-		append_segment(segments, {base, value});
-		return;
-	}
-
-	std::vector<StateSegment> updated;
-	updated.reserve(segments.size() + 1);
-	bool inserted = false;
-
-	for (const auto &segment : segments) {
-		if (segment.end() <= base) {
-			append_segment(updated, segment);
-			continue;
-		}
-
-		if (segment.base >= end) {
-			if (!inserted) {
-				append_segment(updated, {base, value});
-				inserted = true;
-			}
-			append_segment(updated, segment);
-			continue;
-		}
-
-		if (segment.base < base) {
-			append_segment(updated, {
-					segment.base,
-					segment.value.extract(0, (int)(base - segment.base))
-			});
-		}
-
-		if (!inserted) {
-			append_segment(updated, {base, value});
-			inserted = true;
-		}
-
-		if (segment.end() > end) {
-			append_segment(updated, {
-					end,
-					segment.value.extract((int)(end - segment.base), (int)(segment.end() - end))
-			});
-		}
-	}
-
-	if (!inserted)
-		append_segment(updated, {base, value});
-
-	segments.swap(updated);
-}
-
-static void erase_segment(std::vector<StateSegment> &segments, uint64_t base, uint64_t width)
-{
-	if (width == 0 || segments.empty())
-		return;
-
-	uint64_t end = base + width;
-	if (segments.back().end() <= base)
-		return;
-
-	std::vector<StateSegment> updated;
-	updated.reserve(segments.size());
-
-	for (const auto &segment : segments) {
-		if (segment.end() <= base || segment.base >= end) {
-			append_segment(updated, segment);
-			continue;
-		}
-
-		if (segment.base < base) {
-			append_segment(updated, {
-					segment.base,
-					segment.value.extract(0, (int)(base - segment.base))
-			});
-		}
-
-		if (segment.end() > end) {
-			append_segment(updated, {
-					end,
-					segment.value.extract((int)(end - segment.base), (int)(segment.end() - end))
-			});
-		}
-	}
-
-	segments.swap(updated);
-}
-
-static RTLIL::SigSpec value_from_store(const StateSegmentStore &store,
-		Variable variable, uint64_t base, uint64_t width, bool require_present)
-{
-	RTLIL::SigSpec ret;
-	uint64_t end = base + width;
-	auto segments_it = store.by_variable.find(variable);
-	if (segments_it == store.by_variable.end()) {
-		log_assert(!require_present);
-		return RTLIL::SigSpec(RTLIL::Sm, (int)width);
-	}
-
-	const auto &segments = segments_it->second;
-	auto segment_it = first_possible_segment(segments, base);
-	uint64_t pos = base;
-
-	while (pos < end) {
-		if (segment_it == segments.end() || segment_it->base >= end) {
-			log_assert(!require_present);
-			ret.append(RTLIL::SigSpec(RTLIL::Sm, (int)(end - pos)));
-			break;
-		}
-
-		if (pos < segment_it->base) {
-			log_assert(!require_present);
-			ret.append(RTLIL::SigSpec(RTLIL::Sm, (int)(segment_it->base - pos)));
-			pos = segment_it->base;
-			continue;
-		}
-
-		log_assert(pos < segment_it->end());
-		uint64_t width_here = std::min(end - pos, segment_it->end() - pos);
-		ret.append(segment_it->value.extract((int)(pos - segment_it->base), (int)width_here));
-		pos += width_here;
-
-		if (pos == segment_it->end())
-			segment_it++;
-	}
-
-	log_assert(ret.size() == (int)width);
-	return ret;
-}
-
-static void append_static_value(
-		RTLIL::SigSpec &ret, NetlistContext &netlist, Variable variable,
-		uint64_t base, uint64_t width)
-{
-	if (width == 0)
-		return;
-
-	if (variable.kind == Variable::Dummy) {
-		ret.append(RTLIL::SigSpec(RTLIL::Sx, (int)width));
-		return;
-	}
-
-	log_assert(variable.kind == Variable::Static);
-	ret.append(netlist.wire(*variable.get_symbol()).extract((int)base, (int)width));
-}
-
-static void record_undo(VariableState &state, const VariableChunk &chunk)
-{
-	auto &undo_segments = state.revert.by_variable[chunk.variable];
-	std::vector<std::pair<uint64_t, uint64_t>> gaps;
-
-	// Save only spans not already in the undo log. Branch restore is
-	// first-touch based, so later writes must not replace the parent value.
-	uint64_t end = chunk.base + chunk.length;
-	uint64_t pos = chunk.base;
-	auto segment_it = first_possible_segment(undo_segments, chunk.base);
-
-	while (pos < end) {
-		if (segment_it == undo_segments.end() || segment_it->base >= end) {
-			gaps.push_back({pos, end - pos});
-			break;
-		}
-
-		if (pos < segment_it->base) {
-			uint64_t gap_end = std::min(end, segment_it->base);
-			gaps.push_back({pos, gap_end - pos});
-			pos = gap_end;
-			continue;
-		}
-
-		log_assert(pos < segment_it->end());
-		pos = std::min(end, segment_it->end());
-		segment_it++;
-	}
-
-	for (auto [gap_base, gap_width] : gaps) {
-		set_segment(undo_segments, gap_base,
-				value_from_store(state.visible_assignments, chunk.variable, gap_base, gap_width, false));
-	}
-}
-
-static void restore_previous_segment(VariableState &state, Variable variable, StateSegment previous)
-{
-	int pos = 0;
-	auto &segments = state.visible_assignments.by_variable[variable];
-
-	// Undo values use Sm for bits that were absent in the parent state. Split
-	// those runs so restore erases them instead of writing sentinel bits back.
-	while (pos < previous.value.size()) {
-		bool absent = previous.value[pos] == RTLIL::Sm;
-		int start = pos;
-		while (pos < previous.value.size() && (previous.value[pos] == RTLIL::Sm) == absent)
-			pos++;
-
-		uint64_t base = previous.base + start;
-		int width = pos - start;
-		if (absent)
-			erase_segment(segments, base, width);
-		else
-			set_segment(segments, base, previous.value.extract(start, width));
-	}
-
-	if (segments.empty())
-		state.visible_assignments.by_variable.erase(variable);
+	if (auto current = materialized.find(chunk.variable); current != materialized.end())
+		current->second.replace(chunk.base, value);
+	entries.push_back({chunk.variable, chunk.base, value});
 }
 
 void VariableState::set(VariableBits lhs, RTLIL::SigSpec value)
 {
 	log_assert(lhs.bitwidth() == (uint64_t)value.size());
 
-	for (auto [base, size, chunk] : lhs.chunk_spans()) {
-		record_undo(*this, chunk);
-		set_segment(visible_assignments.by_variable[chunk.variable], chunk.base,
-				value.extract((int)base, (int)size));
-	}
+	for (auto [base, size, chunk] : lhs.chunk_spans())
+		visible_assignments.assign(chunk, value.extract(base, size));
 }
 
 RTLIL::SigSpec VariableState::evaluate(NetlistContext &netlist, VariableBits vbits)
 {
 	RTLIL::SigSpec ret;
-	for (auto chunk : vbits.chunks()) {
-		if (chunk.variable.kind == Variable::Dummy)
-			ret.append(RTLIL::SigSpec(RTLIL::Sx, (int)chunk.length));
-		else
-			ret.append(evaluate(netlist, chunk));
-	}
+	for (auto chunk : vbits.chunks())
+		ret.append(evaluate(netlist, chunk));
 	return ret;
 }
 
 RTLIL::SigSpec VariableState::evaluate(NetlistContext &netlist, VariableChunk vchunk)
 {
-	RTLIL::SigSpec ret;
-
-	if (!has_overlap(vchunk)) {
-		append_static_value(ret, netlist, vchunk.variable, vchunk.base, vchunk.length);
-		return ret;
+	auto &value = visible_assignments.materialized[vchunk.variable];
+	if (value.empty()) {
+		value = vchunk.variable.kind == Variable::Dummy ?
+				RTLIL::SigSpec(RTLIL::Sx, vchunk.variable.bitwidth()) :
+				vchunk.variable.kind == Variable::Static ?
+					netlist.wire(*vchunk.variable.get_symbol()) :
+					RTLIL::SigSpec(RTLIL::Sm, vchunk.variable.bitwidth());
+		for (const auto &entry : visible_assignments.entries)
+			if (entry.variable == vchunk.variable)
+				value.replace(entry.base, entry.value);
 	}
-
-	uint64_t end = vchunk.base + vchunk.length;
-	uint64_t pos = vchunk.base;
-	const auto &segments = visible_assignments.by_variable.at(vchunk.variable);
-	auto segment_it = first_possible_segment(segments, vchunk.base);
-
-	while (pos < end) {
-		if (segment_it == segments.end() || segment_it->base >= end) {
-			append_static_value(ret, netlist, vchunk.variable, pos, end - pos);
-			break;
-		}
-
-		if (pos < segment_it->base) {
-			append_static_value(ret, netlist, vchunk.variable, pos, segment_it->base - pos);
-			pos = segment_it->base;
-			continue;
-		}
-
-		log_assert(pos < segment_it->end());
-		uint64_t width_here = std::min(end - pos, segment_it->end() - pos);
-		ret.append(segment_it->value.extract((int)(pos - segment_it->base), (int)width_here));
-		pos += width_here;
-
-		if (pos == segment_it->end())
-			segment_it++;
-	}
-
-	log_assert(ret.size() == (int)vchunk.length);
-	return ret;
+	return value.extract(vchunk.base, vchunk.length);
 }
 
-void VariableState::save(SaveState &save)
-{
-	revert.swap(save);
-}
-
-std::pair<VariableBits, RTLIL::SigSpec> VariableState::restore(SaveState &save)
+std::pair<VariableBits, RTLIL::SigSpec> VariableState::rollback(Checkpoint checkpoint)
 {
 	VariableBits lreverted;
 	RTLIL::SigSpec rreverted;
 
-	// Return branch-final values before rolling visible state back to the
-	// parent branch. The sorted chunk list keeps switch merge output stable.
-	std::vector<VariableChunk> chunks;
-	for (const auto &pair : revert.by_variable) {
-		for (const auto &segment : pair.second)
-			chunks.push_back({pair.first, segment.base, segment.bitwidth()});
-	}
-
-	std::sort(chunks.begin(), chunks.end(), [](const VariableChunk &lhs, const VariableChunk &rhs) {
-		return std::make_tuple(lhs.variable, lhs.base, lhs.length) <
-			   std::make_tuple(rhs.variable, rhs.base, rhs.length);
-	});
-
-	for (auto chunk : chunks) {
-		lreverted.append(VariableBits(chunk));
-		rreverted.append(value_from_store(
-				visible_assignments, chunk.variable, chunk.base, chunk.length, true));
-	}
-
-	for (const auto &pair : revert.by_variable) {
-		for (const auto &segment : pair.second)
-			restore_previous_segment(*this, pair.first, segment);
-	}
-
-	save.swap(revert);
+	for (size_t i = branch_start; i < visible_assignments.entries.size(); i++)
+		lreverted.append(VariableBits(VariableChunk{visible_assignments.entries[i].variable,
+				visible_assignments.entries[i].base,
+				(uint64_t)visible_assignments.entries[i].value.size()}));
+	lreverted.sort_and_unify();
+	for (auto bit : lreverted)
+		rreverted.append(*visible_assignments.find(bit));
+	// Discard whole-variable materializations touched by the removed suffix;
+	// evaluation rebuilds them lazily from the retained journal prefix.
+	for (size_t i = visible_assignments.entries.size(); i-- > branch_start;)
+		visible_assignments.materialized.erase(visible_assignments.entries[i].variable);
+	visible_assignments.entries.resize(std::exchange(branch_start, size_t(checkpoint)));
 	return {lreverted, rreverted};
-}
-
-bool VariableState::has_assignment(VariableBit bit) const
-{
-	return has_overlap({bit.variable, bit.offset, 1});
-}
-
-bool VariableState::has_overlap(VariableChunk chunk) const
-{
-	auto segments_it = visible_assignments.by_variable.find(chunk.variable);
-	if (segments_it == visible_assignments.by_variable.end())
-		return false;
-
-	const auto &segments = segments_it->second;
-	auto segment_it = first_possible_segment(segments, chunk.base);
-	return segment_it != segments.end() && segment_it->base < chunk.base + chunk.length;
-}
-
-RTLIL::SigBit VariableState::assignment(VariableBit bit) const
-{
-	RTLIL::SigSpec value = value_from_store(visible_assignments, bit.variable, bit.offset, 1, true);
-	return value[0];
-}
-
-std::vector<VariableChunk> VariableState::assigned_chunks() const
-{
-	std::vector<VariableChunk> chunks;
-	for (const auto &pair : visible_assignments.by_variable) {
-		for (const auto &segment : pair.second)
-			chunks.push_back({pair.first, segment.base, segment.bitwidth()});
-	}
-
-	std::sort(chunks.begin(), chunks.end(), [](const VariableChunk &lhs, const VariableChunk &rhs) {
-		return std::make_tuple(lhs.variable, lhs.base, lhs.length) <
-			   std::make_tuple(rhs.variable, rhs.base, rhs.length);
-	});
-	return chunks;
 }
 
 int EvalContext::find_nest_level(const ast::Scope *scope)
@@ -923,7 +613,7 @@ void NetlistContext::add_continuous_driver(VariableBits lhs, RTLIL::SigSpec rhs)
 	}
 
 	register_driven(cl);
-	connect(convert_static(cl), cr);
+	canvas->connect(convert_static(cl), cr);
 }
 
 RTLIL::SigSpec EvalContext::connection_lhs(ast::AssignmentExpression const &assign)
@@ -1454,113 +1144,6 @@ RTLIL::SigSpec EvalContext::sva(ast::Expression const &expr)
 	return ret;
 }
 
-static bool evaluates_to_defined_integer(
-		const ast::Expression &expr, ast::EvalContext &context)
-{
-	auto value = expr.eval(context);
-	return value && value.isInteger() && !value.integer().hasUnknown();
-}
-
-static bool has_static_rvalue_shape(EvalContext &context, const ast::Expression &expr)
-{
-	if (!expr.type || !expr.type->isFixedSize() || expr.type->isVoid())
-		return false;
-
-	// Keep this prefilter cheaper and stricter than LValue::analyze(), which
-	// may evaluate selectors and construct addressing state before rejecting.
-	switch (expr.kind) {
-	case ast::ExpressionKind::HierarchicalValue:
-	case ast::ExpressionKind::NamedValue: {
-		const ast::Symbol &symbol = expr.as<ast::ValueExpressionBase>().symbol;
-		return ast::ValueSymbol::isKind(symbol.kind) &&
-				!ast::ParameterSymbol::isKind(symbol.kind) &&
-				!context.netlist.is_inferred_memory(symbol);
-	}
-	case ast::ExpressionKind::MemberAccess:
-		return has_static_rvalue_shape(
-				context, expr.as<ast::MemberAccessExpression>().value());
-	case ast::ExpressionKind::ElementSelect: {
-		const auto &select = expr.as<ast::ElementSelectExpression>();
-		if (!select.value().type->isBitstreamType() || !select.value().type->hasFixedRange() ||
-				context.netlist.is_inferred_memory(select.value()))
-			return false;
-		return evaluates_to_defined_integer(select.selector(), context.const_) &&
-				has_static_rvalue_shape(context, select.value());
-	}
-	case ast::ExpressionKind::RangeSelect: {
-		const auto &select = expr.as<ast::RangeSelectExpression>();
-		if (!select.value().type->isBitstreamType() || !select.value().type->hasFixedRange())
-			return false;
-
-		if (!evaluates_to_defined_integer(select.left(), context.const_) ||
-				!evaluates_to_defined_integer(select.right(), context.const_))
-			return false;
-
-		return has_static_rvalue_shape(context, select.value());
-	}
-	case ast::ExpressionKind::Conversion: {
-		const auto &conversion = expr.as<ast::ConversionExpression>();
-		if (conversion.operand().kind == ast::ExpressionKind::Streaming)
-			return false;
-		const ast::Type &from = conversion.operand().type->getCanonicalType();
-		const ast::Type &to = conversion.type->getCanonicalType();
-		return to.isBitstreamType() && from.isBitstreamType() &&
-				from.getBitstreamWidth() == to.getBitstreamWidth() &&
-				has_static_rvalue_shape(context, conversion.operand());
-	}
-	case ast::ExpressionKind::Concatenation: {
-		const auto &concat = expr.as<ast::ConcatenationExpression>();
-		for (auto operand : concat.operands()) {
-			if (!has_static_rvalue_shape(context, *operand))
-				return false;
-		}
-		return true;
-	}
-	default:
-		return false;
-	}
-}
-
-static uint64_t variable_bits_cache_cost(const VariableBits &bits)
-{
-	uint64_t cost = bits.bitwidth();
-	for (auto chunk : bits.chunks()) {
-		(void)chunk;
-		cost += 16;
-	}
-	return cost;
-}
-
-std::optional<RTLIL::SigSpec> EvalContext::static_rvalue_signal(ast::Expression const &expr)
-{
-	if (procedural || in_sva_expression || !has_static_rvalue_shape(*this, expr))
-		return std::nullopt;
-
-	auto cached = netlist.static_rvalue_cache.find(&expr);
-	if (cached != netlist.static_rvalue_cache.end())
-		return cached->second;
-
-	auto lvalue = LValue::analyze(*this, expr, true);
-	if (!lvalue || !lvalue->is_static())
-		return std::nullopt;
-
-	VariableBits bits = lvalue->evaluate_vbits();
-	if (bits.bitwidth() != expr.type->getBitstreamWidth() || bits.has_dummy_bits())
-		return std::nullopt;
-
-	// Store only fully validated static RHS expressions; any rejected shape
-	// falls back to the normal expression lowering path.
-	uint64_t cost = variable_bits_cache_cost(bits);
-	RTLIL::SigSpec signal = netlist.convert_static(bits);
-	if (netlist.static_rvalue_cache.size() < static_rvalue_cache_max_entries &&
-			netlist.static_rvalue_cache_cost + cost <= static_rvalue_cache_max_cost) {
-		netlist.static_rvalue_cache[&expr] = signal;
-		netlist.static_rvalue_cache_cost += cost;
-	}
-
-	return signal;
-}
-
 RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 {
 	RTLIL::Module *mod = netlist.canvas;
@@ -1598,12 +1181,6 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 			}
 		}
 	}
-
-	if (auto static_signal = static_rvalue_signal(expr)) {
-		ret = *static_signal;
-		goto done;
-	}
-
 	switch (expr.kind) {
 	case ast::ExpressionKind::Assignment:
 		{
@@ -1662,16 +1239,14 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				require(valsym, valsym.getInitializer());
 				auto exprconst = valsym.getInitializer()->eval(this->const_);
 				require(valsym, exprconst.isInteger());
-				ret = convert_svint(exprconst.integer());
-				goto done;
+				return convert_svint(exprconst.integer());
 			}
 
 			if (ast::ModportPortSymbol::isKind(symbol.kind) &&
 					!netlist.scopes_remap.count(symbol.getParentScope())) {
 				auto &modport_port = symbol.as<ast::ModportPortSymbol>();
 				ast_invariant(symbol, modport_port.getConnectionExpr() != nullptr);
-				ret = (*this)(*modport_port.getConnectionExpr());
-				goto done;
+				return (*this)(*modport_port.getConnectionExpr());
 			}
 
 			ast_invariant(symbol, ast::ValueSymbol::isKind(symbol.kind));
@@ -1763,14 +1338,13 @@ RTLIL::SigSpec EvalContext::operator()(ast::Expression const &expr)
 				if (!right.is_fully_const()) {
 					netlist.add_diag(diag::NonconstWildcardEq, expr.sourceRange);
 					ret = netlist.add_placeholder_signal(expr.type->getBitstreamWidth());
-					goto done;
+					return ret;
 				}
-				ret = netlist.Unop(
+				return netlist.Unop(
 					invert ? ID($logic_not) : ID($reduce_bool),
 					netlist.EqWildcard(left, right),
 					false, expr.type->getBitstreamWidth()
 				);
-				goto done;
 			default:
 				break;
 			}
@@ -2122,7 +1696,7 @@ public:
 			if (!dangling.count(driven_bit)) {
 				// No latch inferred
 				cl.append(driven_bit);
-				cr.append(procedure.vstate.assignment(driven_bit));
+				cr.append(*procedure.vstate.visible_assignments.find(driven_bit));
 			} else {
 				latch_driven.append(driven_bit);
 			}
@@ -2285,7 +1859,7 @@ public:
 					for (uint64_t i = 0; i < driven_chunk.bitwidth(); i++) {
 						// Is this variable bit assigned to from the async branch?
 						// Depending on this we either use $aldff or $dffe to drive it
-						if (aloads[0].values.has_assignment(driven_chunk[i]))
+						if (aloads[0].values.visible_assignments.find(driven_chunk[i]))
 							aldff_q.append(driven_chunk[i]);
 						else
 							dffe_q.append(driven_chunk[i]);
@@ -2446,21 +2020,6 @@ public:
 			return;
 
 		netlist.add_diag(diag::MultiportUnsupported, sym.location);
-	}
-
-	void assign_module_port_ids(const ast::InstanceBodySymbol &body)
-	{
-		int port_id = 1;
-		for (const ast::Symbol *symbol : body.getPortList()) {
-			if (ast::PortSymbol::isKind(symbol->kind)) {
-				auto &port = symbol->as<ast::PortSymbol>();
-				if (port.internalSymbol && port.internalSymbol->name == port.name) {
-					RTLIL::Wire *wire = netlist.wire(*port.internalSymbol).as_wire();
-					wire->port_id = port_id;
-				}
-			}
-			port_id++;
-		}
 	}
 
 	void inline_port_connection(const ast::PortSymbol &port, RTLIL::SigSpec connection, slang::SourceRange range)
@@ -2853,6 +2412,8 @@ public:
 			netlist.add_diag(diag::GenericTimingUnsyn, sym.getDelay()->sourceRange);
 
 		const ast::AssignmentExpression &expr = sym.getAssignment().as<ast::AssignmentExpression>();
+		// Bound retained diagnostics and other constant-evaluation state to one RHS.
+		netlist.eval.const_.reset();
 		ast_invariant(expr, !expr.timingControl);
 
 		RTLIL::SigSpec rvalue = netlist.eval(expr.right());
@@ -2994,7 +2555,6 @@ public:
 			// onto RTLIL wires
 			finalize_variable_initialization(netlist);
 			finalize_special_nets(netlist);
-			assign_module_port_ids(body);
 		} else {
 			visitDefault(body);
 		}
@@ -3695,6 +3255,7 @@ const RTLIL::SigSpec& NetlistContext::wire(const ast::Symbol &symbol)
 RTLIL::SigSpec NetlistContext::convert_static(VariableBits bits)
 {
 	RTLIL::SigSpec ret;
+
 	for (auto vchunk : bits.chunks()) {
 		switch (vchunk.variable.kind) {
 		case Variable::Static: {
@@ -3737,7 +3298,8 @@ NetlistContext::NetlistContext(
 
 NetlistContext::~NetlistContext()
 {
-	// move constructor could have cleared our canvas pointer
+	// Module-producing paths must explicitly flush partial batches before teardown.
+	log_assert(binary_cell_batches.empty());
 	if (canvas) {
 		canvas->fixup_ports();
 		canvas->check();
@@ -4043,6 +3605,9 @@ struct SlangFrontend : Frontend {
 						continue;
 					driver.diagEngine.issue(diags[i]);
 				}
+				for (auto &[key, batch] : netlist.binary_cell_batches)
+					netlist.finish_binary_cell_batch(std::get<0>(key), batch);
+				netlist.binary_cell_batches.clear();
 			}
 
 			if (check_diagnostics(driver.diagEngine, {}, /*last=*/true))
@@ -4287,6 +3852,9 @@ struct TestSlangExprPass : Pass {
 				nfailures++;
 			}
 		}));
+		for (auto &[key, batch] : netlist.binary_cell_batches)
+			netlist.finish_binary_cell_batch(std::get<0>(key), batch);
+		netlist.binary_cell_batches.clear();
 
 		if (!nfailures)
 			log("%d tests passed.\n", ntests);

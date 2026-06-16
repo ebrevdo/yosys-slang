@@ -71,7 +71,7 @@ std::optional<LValue> LValue::analyze(
 				expr, rse.value().type->isBitstreamType() && rse.value().type->hasFixedRange());
 		AddressingResolver resolver(context, rse);
 
-		std::optional<LValue> inner = analyze(context, rse.value(), silent);
+		std::optional<LValue> inner = analyze(context, rse.value());
 		if (!inner)
 			return std::nullopt;
 
