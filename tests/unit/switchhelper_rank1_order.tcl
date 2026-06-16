@@ -35,6 +35,18 @@ set second_text [normalized_rtlil $second_dump]
 
 file delete -force $first_dump $second_dump
 
+foreach expected_port {
+	{wire width 2 input 1 \sel}
+	{wire width 8 input 2 \a}
+	{wire width 8 input 3 \b}
+	{wire width 8 input 4 \c}
+	{wire width 8 output 5 \y}
+} {
+	if {[string first "\n  $expected_port\n" $first_text] < 0} {
+		error "missing source-ordered RTLIL port: $expected_port"
+	}
+}
+
 if {$first_text ne $second_text} {
 	error "switchhelper_rank1_order RTLIL output changed between identical reads"
 }

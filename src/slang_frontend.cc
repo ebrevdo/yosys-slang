@@ -2012,6 +2012,9 @@ public:
 			netlist.add_diag(diag::RefUnsupported, symbol.location);
 			break;
 		}
+
+		// Scope indices preserve declaration order without relying on IdString allocation.
+		w->port_id = int(symbol.getIndex()) + 1;
 	}
 
 	void handle(const ast::MultiPortSymbol &sym)
