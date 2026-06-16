@@ -316,18 +316,16 @@ public:
 			void swap(SegmentStore &other) { by_variable.swap(other.by_variable); }
 		};
 
-		// Keep the established name until SwitchHelper moves to chunk-aware
-		// branch merging in the following commit.
-		using Map = SegmentStore;
+		using SaveState = SegmentStore;
 
 		SegmentStore visible_assignments;
-		Map revert;
+		SaveState revert;
 
 		void set(VariableBits lhs, RTLIL::SigSpec value);
 		RTLIL::SigSpec evaluate(NetlistContext &netlist, VariableBits vbits);
 		RTLIL::SigSpec evaluate(NetlistContext &netlist, VariableChunk vchunk);
-		void save(Map &save);
-		std::pair<VariableBits, RTLIL::SigSpec> restore(Map &save);
+		void save(SaveState &save);
+		std::pair<VariableBits, RTLIL::SigSpec> restore(SaveState &save);
 		bool has_assignment(VariableBit bit) const;
 		bool has_overlap(VariableChunk chunk) const;
 		RTLIL::SigBit assignment(VariableBit bit) const;

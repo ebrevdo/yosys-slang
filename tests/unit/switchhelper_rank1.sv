@@ -1,3 +1,110 @@
+module switchhelper_rank1_alignment(
+	input logic sel,
+	input logic [7:0] seed
+);
+	logic [7:0] actual;
+	logic [7:0] expected;
+
+	always_comb begin
+		actual = seed;
+		expected = seed;
+
+		if (sel) begin
+			{actual[0], actual[7], actual[3:2]} = {seed[6], seed[1], seed[5:4]};
+			expected[0] = seed[6];
+			expected[7] = seed[1];
+			expected[3:2] = seed[5:4];
+		end else begin
+			{actual[6:5], actual[1]} = {seed[2:1], seed[7]};
+			expected[6:5] = seed[2:1];
+			expected[1] = seed[7];
+		end
+
+		if (sel !== 1'bx)
+			assert(actual === expected);
+	end
+endmodule
+
+module switchhelper_rank1_partial_overlap(
+	input logic sel,
+	input logic [7:0] base,
+	input logic [5:0] hi,
+	input logic [5:0] lo
+);
+	logic [7:0] actual;
+	logic [7:0] expected;
+
+	always_comb begin
+		actual = base;
+		expected = base;
+
+		if (sel) begin
+			actual[7:2] = hi;
+			expected[7:2] = hi;
+		end else begin
+			actual[5:0] = lo;
+			expected[5:0] = lo;
+		end
+
+		if (sel !== 1'bx)
+			assert(actual === expected);
+	end
+endmodule
+
+module switchhelper_rank1_automatic_eos(
+	input logic sel,
+	input logic [3:0] a,
+	input logic [3:0] b
+);
+	logic [3:0] actual;
+	logic [3:0] expected;
+
+	always_comb begin
+		actual = 4'h0;
+
+		if (sel) begin
+			automatic logic [3:0] tmp;
+			tmp = {a[0], a[3:1]};
+			actual = tmp;
+		end else begin
+			automatic logic [3:0] tmp;
+			tmp = {b[2:0], b[3]};
+			actual = tmp;
+		end
+
+		expected = sel ? {a[0], a[3:1]} : {b[2:0], b[3]};
+
+		if (sel !== 1'bx)
+			assert(actual === expected);
+	end
+endmodule
+
+module switchhelper_rank1_order(
+	input logic [1:0] sel,
+	input logic [7:0] a,
+	input logic [7:0] b,
+	input logic [7:0] c,
+	output logic [7:0] y
+);
+	always_comb begin
+		y = a;
+		case (sel)
+			2'b00: begin
+				y[7:2] = b[5:0];
+			end
+			2'b01: begin
+				{y[1], y[6:5], y[3]} = {c[7], c[2:1], c[0]};
+			end
+			2'b10: begin
+				y[5:0] = c[5:0];
+			end
+			default: begin
+				y[4:2] = b[7:5];
+			end
+		endcase
+	end
+endmodule
+
 module switchhelper_rank1_reentrant_automatic_local(
 	input logic sel,
 	input logic [5:0] seed
