@@ -1,0 +1,10 @@
+read_slang --compat=vcs <<EOF_SV
+module static_oob_rvalue(
+	input logic [1:0][31:0] data,
+	output logic [31:0] result
+);
+	assign result = data[2];
+endmodule
+EOF_SV
+
+check -assert

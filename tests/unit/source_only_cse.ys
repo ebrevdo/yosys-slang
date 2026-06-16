@@ -1,0 +1,190 @@
+read_slang <<EOF
+module source_only_cse(
+	input logic a,
+	input logic b,
+	output logic and_first,
+	output logic and_commuted,
+	output logic and_duplicate,
+	output logic or_first,
+	output logic or_commuted,
+	output logic not_first,
+	output logic not_duplicate
+);
+	assign and_first = a & b;
+	assign and_commuted = b & a;
+	assign and_duplicate = a & b;
+	assign or_first = a | b;
+	assign or_commuted = b | a;
+	assign not_first = ~a;
+	assign not_duplicate = ~a;
+endmodule
+
+module attributed_cse_bypass(
+	input logic a,
+	input logic b,
+	output logic first,
+	output logic second
+);
+	assign first = a & (* marker = 1 *) b;
+	assign second = a & (* marker = 2 *) b;
+endmodule
+
+module source_batched(
+	input logic [1:0] a,
+	input logic [1:0] b,
+	output logic [1:0] y
+);
+	for (genvar i = 0; i < 2; i++)
+		assign y[i] = a[i] & b[i];
+endmodule
+
+module source_batched_boundary(
+	input logic [8:0] a,
+	input logic [8:0] b,
+	output logic [8:0] y
+);
+	for (genvar i = 0; i < 9; i++)
+		assign y[i] = a[i] & b[i];
+endmodule
+
+module source_not_batched_boundary(
+	input logic [8:0] a,
+	output logic [8:0] y
+);
+	for (genvar i = 0; i < 9; i++)
+		assign y[i] = ~a[i];
+endmodule
+
+module source_logic_not_batched_boundary(
+	input logic [8:0] a,
+	output logic [8:0] y
+);
+	for (genvar i = 0; i < 9; i++)
+		assign y[i] = !a[i];
+endmodule
+
+module source_scalar_reductions(
+	input logic [8:0] a,
+	output logic [8:0] and_y,
+	output logic [8:0] or_y,
+	output logic [8:0] xor_y,
+	output logic [8:0] xnor_y
+);
+	for (genvar i = 0; i < 9; i++) begin
+		assign and_y[i] = &a[i];
+		assign or_y[i] = |a[i];
+		assign xor_y[i] = ^a[i];
+		assign xnor_y[i] = ~^a[i];
+	end
+endmodule
+
+module source_eq_not_batched(
+	input logic [8:0] a,
+	input logic [8:0] b,
+	output logic [8:0] eq_y,
+	output logic [8:0] ne_y,
+	output logic [8:0] not_y,
+	output logic [8:0] logic_and_y,
+	output logic [8:0] logic_or_y
+);
+	for (genvar i = 0; i < 9; i++) begin
+		assign eq_y[i] = a[i] == b[i];
+		assign ne_y[i] = a[i] != b[i];
+		assign not_y[i] = ~a[i];
+		assign logic_and_y[i] = a[i] && b[i];
+		assign logic_or_y[i] = a[i] || b[i];
+	end
+endmodule
+
+module wide_cse_bypass(
+	input logic [3:0] a,
+	input logic [3:0] b,
+	output logic [3:0] first,
+	output logic [3:0] second
+);
+	assign first = a & b;
+	assign second = a & b;
+endmodule
+
+module signed_cse_bypass(
+	input logic signed a,
+	input logic signed b,
+	output logic first,
+	output logic second
+);
+	assign first = a & b;
+	assign second = a & b;
+endmodule
+
+module wide_not_cse(
+	input logic [31:0] a,
+	output logic [31:0] first,
+	output logic [31:0] second
+);
+	assign first = ~a;
+	assign second = ~a;
+endmodule
+
+module attributed_wide_not_bypass(
+	input logic [31:0] a,
+	output logic [31:0] first,
+	output logic [31:0] second
+);
+	assign first = ~(* marker = 1 *) a;
+	assign second = ~(* marker = 2 *) a;
+endmodule
+
+EOF
+
+select -module source_only_cse
+select -assert-count 1 t:$and
+select -assert-count 1 t:$or
+select -assert-count 1 t:$not
+select -assert-count 3 a:src
+
+select -module attributed_cse_bypass
+select -assert-count 2 t:$and
+select -assert-count 1 t:$and a:marker=1 %i
+select -assert-count 1 t:$and a:marker=2 %i
+
+select -module source_batched
+select -assert-count 1 t:$and
+select -assert-count 1 t:$and r:Y_WIDTH=8 %i
+
+select -module source_batched_boundary
+select -assert-count 2 t:$and
+select -assert-count 2 t:$and r:Y_WIDTH=8 %i
+
+select -module source_not_batched_boundary
+select -assert-count 2 t:$not
+select -assert-count 2 t:$not r:Y_WIDTH=8 %i
+
+select -module source_logic_not_batched_boundary
+select -assert-count 2 t:$not
+select -assert-count 2 t:$not r:Y_WIDTH=8 %i
+
+select -module source_scalar_reductions
+select -assert-count 9 t:$not r:Y_WIDTH=1 %i
+select -assert-none t:$reduce_and t:$reduce_or t:$reduce_xor t:$reduce_xnor t:$reduce_bool
+
+select -module source_eq_not_batched
+select -assert-count 2 t:$xor r:Y_WIDTH=8 %i
+select -assert-count 2 t:$xnor r:Y_WIDTH=8 %i
+select -assert-count 2 t:$not r:Y_WIDTH=8 %i
+select -assert-count 2 t:$and r:Y_WIDTH=8 %i
+select -assert-count 2 t:$or r:Y_WIDTH=8 %i
+select -assert-none t:$eq t:$ne t:$logic_and t:$logic_or
+
+select -module wide_cse_bypass
+select -assert-count 2 t:$and
+
+select -module signed_cse_bypass
+select -assert-count 2 t:$and
+
+select -module wide_not_cse
+select -assert-count 2 t:$not
+
+select -module attributed_wide_not_bypass
+select -assert-count 2 t:$not
+select -assert-count 1 t:$not a:marker=1 %i
+select -assert-count 1 t:$not a:marker=2 %i

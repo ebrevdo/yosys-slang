@@ -8,7 +8,6 @@ module top(input clk, input [7:0] a, input [7:0] data, output reg [7:0] q);
 	end
 endmodule
 EOF
-
 memory_collect
 select -assert-count 1 t:$mem_v2
 
@@ -22,7 +21,6 @@ module top(input clk, input [7:0] a, input [7:0] data, output reg [7:0] q);
 	end
 endmodule
 EOF
-
 memory_collect
 select -assert-none t:$mem_v2
 
@@ -297,16 +295,22 @@ module top(
 	input [1:0] a,
 	input [7:0] data,
 	output [7:0] q_const,
-	output [7:0] q_dyn
+	output [7:0] q_dyn,
+	output q_bit
 );
-	reg [7:0] x[0:3];
+	typedef struct packed {
+		logic foo;
+		logic [6:0] bar;
+	} word_t;
+	word_t x[0:3];
 
 	assign q_const = x[2];
 	assign q_dyn = x[a];
+	assign q_bit = x[a].foo;
 
 	always @(posedge clk)
 		x[a] <= data;
 endmodule
 EOF
 memory_collect
-select -assert-count 1 t:$mem_v2 r:RD_PORTS=2 %i
+select -assert-count 1 t:$mem_v2 r:RD_PORTS=3 %i

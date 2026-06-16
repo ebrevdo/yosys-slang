@@ -19,7 +19,8 @@ module expression_attrs(
 endmodule
 EOF
 
-select -assert-count 2 t:$and A:src %i
-select -assert-count 1 t:$mux A:src %i
-select -assert-count 1 t:$not A:src %i
-select -assert-count 1 t:$xor A:src %i
+select -assert-count 2 t:$and a:src %i
+select -assert-count 1 t:$mux a:src %i
+select -assert-count 1 t:$not a:src %i
+select -assert-count 1 t:$xor a:src %i
+select -assert-none t:$buf
