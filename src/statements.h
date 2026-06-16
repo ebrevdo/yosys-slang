@@ -139,8 +139,9 @@ struct SwitchHelper
 				// get the wire (or some part of it) which we created up above
 				RTLIL::SigSpec target_w;
 				for (uint64_t i = 0; i < chunk.bitwidth(); i++) {
-					log_assert(va.find(chunk[i]));
-					target_w.append(*va.find(chunk[i]));
+					auto assignment = va.find(chunk[i]);
+					log_assert(assignment.has_value());
+					target_w.append(*assignment);
 				}
 
 				rule->aux_actions.push_back(
