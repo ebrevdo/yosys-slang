@@ -462,80 +462,71 @@ const ast::InstanceBodySymbol &get_instance_body(SynthesisSettings &settings, co
 
 using VariableState = ProceduralContext::VariableState;
 
+std::optional<RTLIL::SigBit> VariableState::AssignmentJournal::find(const VariableBit &bit) const
+{
+	for (auto entry = entries.rbegin(); entry != entries.rend(); entry++)
+		if (entry->variable == bit.variable && bit.offset >= entry->base &&
+				bit.offset < entry->base + entry->value.size())
+			return entry->value[bit.offset - entry->base];
+	return {};
+}
+
+void VariableState::AssignmentJournal::assign(VariableChunk chunk, RTLIL::SigSpec value)
+{
+	if (auto current = materialized.find(chunk.variable); current != materialized.end())
+		current->second.replace(chunk.base, value);
+	entries.push_back({chunk.variable, chunk.base, value});
+}
+
 void VariableState::set(VariableBits lhs, RTLIL::SigSpec value)
 {
 	log_assert(lhs.bitwidth() == (uint64_t)value.size());
 
-	for (uint64_t i = 0; i < lhs.bitwidth(); i++) {
-		VariableBit bit = lhs[i];
-
-		if (!revert.count(bit)) {
-			if (visible_assignments.count(bit))
-				revert[bit] = visible_assignments.at(bit);
-			else
-				revert[bit] = RTLIL::Sm;
-		}
-
-		visible_assignments[bit] = value[i];
-	}
+	for (auto [base, size, chunk] : lhs.chunk_spans())
+		visible_assignments.assign(chunk, value.extract(base, size));
 }
 
 RTLIL::SigSpec VariableState::evaluate(NetlistContext &netlist, VariableBits vbits)
 {
 	RTLIL::SigSpec ret;
-	for (auto vbit : vbits) {
-		if (vbit.variable.kind == Variable::Dummy) {
-			ret.append(RTLIL::Sx);
-		} else if (visible_assignments.count(vbit)) {
-			ret.append(visible_assignments.at(vbit));
-		} else {
-			log_assert(vbit.variable.kind == Variable::Static);
-			ret.append(netlist.wire(*vbit.variable.get_symbol())[(int)vbit.offset]);
-		}
-	}
+	for (auto chunk : vbits.chunks())
+		ret.append(evaluate(netlist, chunk));
 	return ret;
 }
 
 RTLIL::SigSpec VariableState::evaluate(NetlistContext &netlist, VariableChunk vchunk)
 {
-	RTLIL::SigSpec ret;
-	for (uint64_t i = 0; i < vchunk.bitwidth(); i++) {
-		if (visible_assignments.count(vchunk[i])) {
-			ret.append(visible_assignments.at(vchunk[i]));
-		} else {
-			log_assert(vchunk.variable.kind == Variable::Static);
-			ret.append(netlist.wire(*vchunk.variable.get_symbol())[(int)(vchunk.base + i)]);
-		}
+	auto &value = visible_assignments.materialized[vchunk.variable];
+	if (value.empty()) {
+		value = vchunk.variable.kind == Variable::Dummy ?
+				RTLIL::SigSpec(RTLIL::Sx, vchunk.variable.bitwidth()) :
+				vchunk.variable.kind == Variable::Static ?
+					netlist.wire(*vchunk.variable.get_symbol()) :
+					RTLIL::SigSpec(RTLIL::Sm, vchunk.variable.bitwidth());
+		for (const auto &entry : visible_assignments.entries)
+			if (entry.variable == vchunk.variable)
+				value.replace(entry.base, entry.value);
 	}
-	return ret;
+	return value.extract(vchunk.base, vchunk.length);
 }
 
-void VariableState::save(Map &save)
-{
-	revert.swap(save);
-}
-
-std::pair<VariableBits, RTLIL::SigSpec> VariableState::restore(Map &save)
+std::pair<VariableBits, RTLIL::SigSpec> VariableState::rollback(Checkpoint checkpoint)
 {
 	VariableBits lreverted;
 	RTLIL::SigSpec rreverted;
 
-	for (auto pair : revert)
-		lreverted.append(pair.first);
-	lreverted.sort();
-
-	//rreverted.reserve(lreverted.bitwidth());
+	for (size_t i = branch_start; i < visible_assignments.entries.size(); i++)
+		lreverted.append(VariableBits(VariableChunk{visible_assignments.entries[i].variable,
+				visible_assignments.entries[i].base,
+				(uint64_t)visible_assignments.entries[i].value.size()}));
+	lreverted.sort_and_unify();
 	for (auto bit : lreverted)
-		rreverted.append(visible_assignments.at(bit));
-
-	for (auto pair : revert) {
-		if (pair.second == RTLIL::Sm)
-			visible_assignments.erase(pair.first);
-		else
-			visible_assignments[pair.first] = pair.second;
-	}
-
-	save.swap(revert);
+		rreverted.append(*visible_assignments.find(bit));
+	// Discard whole-variable materializations touched by the removed suffix;
+	// evaluation rebuilds them lazily from the retained journal prefix.
+	for (size_t i = visible_assignments.entries.size(); i-- > branch_start;)
+		visible_assignments.materialized.erase(visible_assignments.entries[i].variable);
+	visible_assignments.entries.resize(std::exchange(branch_start, size_t(checkpoint)));
 	return {lreverted, rreverted};
 }
 
@@ -1706,7 +1697,7 @@ public:
 			if (!dangling.count(driven_bit)) {
 				// No latch inferred
 				cl.append(driven_bit);
-				cr.append(procedure.vstate.visible_assignments.at(driven_bit));
+				cr.append(*procedure.vstate.visible_assignments.find(driven_bit));
 			} else {
 				latch_driven.append(driven_bit);
 			}
@@ -1869,7 +1860,7 @@ public:
 					for (uint64_t i = 0; i < driven_chunk.bitwidth(); i++) {
 						// Is this variable bit assigned to from the async branch?
 						// Depending on this we either use $aldff or $dffe to drive it
-						if (aloads[0].values.visible_assignments.count(driven_chunk[i]))
+						if (aloads[0].values.visible_assignments.find(driven_chunk[i]))
 							aldff_q.append(driven_chunk[i]);
 						else
 							dffe_q.append(driven_chunk[i]);

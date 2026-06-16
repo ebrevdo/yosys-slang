@@ -296,16 +296,32 @@ private:
 
 public:
 	struct VariableState {
-		using Map = Yosys::dict<VariableBit, RTLIL::SigBit>;
+		// Assignments are an append-only log; materialized values cache hot variables.
+		// Branch save points are log indices, so restoring a branch only drops its suffix.
+		struct AssignmentJournal {
+			struct Entry {
+				Variable variable;
+				uint64_t base;
+				RTLIL::SigSpec value;
+			};
+			std::vector<Entry> entries;
+			Yosys::dict<Variable, RTLIL::SigSpec> materialized;
 
-		Map visible_assignments;
-		Map revert;
+			std::optional<RTLIL::SigBit> find(const VariableBit &bit) const;
+			void assign(VariableChunk chunk, RTLIL::SigSpec value);
+		};
+		AssignmentJournal visible_assignments;
+		enum class Checkpoint : size_t {};
+		size_t branch_start = 0;
 
 		void set(VariableBits lhs, RTLIL::SigSpec value);
 		RTLIL::SigSpec evaluate(NetlistContext &netlist, VariableBits vbits);
 		RTLIL::SigSpec evaluate(NetlistContext &netlist, VariableChunk vchunk);
-		void save(Map &save);
-		std::pair<VariableBits, RTLIL::SigSpec> restore(Map &save);
+		Checkpoint checkpoint()
+		{
+			return Checkpoint(std::exchange(branch_start, visible_assignments.entries.size()));
+		}
+		std::pair<VariableBits, RTLIL::SigSpec> rollback(Checkpoint checkpoint);
 	};
 
 	VariableState vstate;

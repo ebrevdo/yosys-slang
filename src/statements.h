@@ -24,7 +24,7 @@ struct SwitchHelper
 	using VariableState = ProceduralContext::VariableState;
 
 	VariableState &vstate;
-	VariableState::Map save_map;
+	VariableState::Checkpoint checkpoint{};
 	std::vector<std::tuple<Case *, VariableBits, RTLIL::SigSpec>> branch_updates;
 	bool entered = false, finished = false;
 
@@ -47,15 +47,14 @@ struct SwitchHelper
 		  vstate(other.vstate), entered(other.entered), finished(other.finished)
 	{
 		branch_updates.swap(other.branch_updates);
-		save_map.swap(other.save_map);
+		std::swap(checkpoint, other.checkpoint);
 		other.entered = false;
 		other.finished = false;
 	}
 
 	void enter_branch(std::vector<RTLIL::SigSpec> compare)
 	{
-		save_map.clear();
-		vstate.save(save_map);
+		checkpoint = vstate.checkpoint();
 		log_assert(!entered);
 		log_assert(current_case == parent);
 		current_case = sw->add_case(compare);
@@ -69,7 +68,7 @@ struct SwitchHelper
 		Case *this_case = current_case;
 		current_case = parent;
 		entered = false;
-		auto updates = vstate.restore(save_map);
+		auto updates = vstate.rollback(checkpoint);
 		branch_updates.push_back(std::make_tuple(this_case, updates.first, updates.second));
 	}
 
@@ -99,13 +98,13 @@ struct SwitchHelper
 
 		auto &va = vstate.visible_assignments;
 		for (auto bit : updated_anybranch)
-			if (bit.variable.kind != Variable::Static && !va.count(bit))
+			if (bit.variable.kind != Variable::Static && !va.find(bit))
 				eos_variables.insert(bit.variable);
 
 		for (auto chunk : updated_anybranch.chunks()) {
 			if (chunk.variable.kind != Variable::Static && eos_variables.count(chunk.variable)) {
 				for (uint64_t i = 0; i < chunk.bitwidth(); i++)
-					log_assert(!va.count(chunk[i]));
+					log_assert(!va.find(chunk[i]));
 
 				continue;
 			}
@@ -140,8 +139,9 @@ struct SwitchHelper
 				// get the wire (or some part of it) which we created up above
 				RTLIL::SigSpec target_w;
 				for (uint64_t i = 0; i < chunk.bitwidth(); i++) {
-					log_assert(va.count(chunk[i]));
-					target_w.append(va.at(chunk[i]));
+					auto assignment = va.find(chunk[i]);
+					log_assert(assignment.has_value());
+					target_w.append(*assignment);
 				}
 
 				rule->aux_actions.push_back(

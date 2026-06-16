@@ -135,10 +135,9 @@ void ProceduralContext::copy_case_tree_into(RTLIL::CaseRule &rule)
 VariableBits ProceduralContext::all_driven()
 {
 	VariableBits all_driven;
-	for (auto pair : vstate.visible_assignments) {
-		all_driven.append(pair.first);
-	}
-
+	for (const auto &entry : vstate.visible_assignments.entries)
+		all_driven.append(VariableBits(
+				VariableChunk{entry.variable, entry.base, (uint64_t)entry.value.size()}));
 	all_driven.sort_and_unify();
 
 	VariableBits all_driven_filtered;
