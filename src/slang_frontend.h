@@ -337,6 +337,20 @@ private:
 
 struct RTLILBuilder {
 	using SigSpec = RTLIL::SigSpec;
+	// Wire keys use nonempty names and nonnegative offsets; constants use an
+	// empty name and negative state encodings, so the domains cannot collide.
+	using BitKey = std::pair<RTLIL::IdString, int>;
+	static constexpr auto bit_key = [](RTLIL::SigBit bit) {
+		return BitKey(bit.wire ? bit.wire->name : RTLIL::IdString(),
+				bit.wire ? bit.offset : -1 - int(bit.data));
+	};
+	// Same-source scalar operations fill one eight-bit cell; a final partial batch is zero-padded.
+	struct BinaryCellBatch {
+		RTLIL::IdString id;
+		slang::SourceRange source;
+		SigSpec a, b;
+		int y_offset, used = 8;
+	};
 
 	RTLIL::Module *canvas;
 	Yosys::dict<RTLIL::IdString, RTLIL::Const> staged_attributes;
@@ -344,9 +358,17 @@ struct RTLILBuilder {
 	// cell; many expression leaves never need an `src` string.
 	slang::SourceRange staged_source_range;
 	bool staged_source_range_valid = false;
+	// Share source-only one-bit boolean cells without dropping user attributes.
+	// Operation-keyed lanes cache AND, OR, NOT, XOR, and XNOR cells.
+	Yosys::dict<RTLIL::IdString, Yosys::dict<std::pair<BitKey, BitKey>, int>>
+		binary_cell_cache;
+	Yosys::dict<std::tuple<RTLIL::IdString, uint32_t, uint64_t, uint64_t>, BinaryCellBatch>
+		binary_cell_batches;
+	RTLIL::Wire *generated_y = nullptr;
 
 	unsigned next_id = 0;
 	std::string new_id(std::string base = std::string());
+	void finish_binary_cell_batch(RTLIL::IdString op, BinaryCellBatch &batch);
 
 	SigSpec ReduceBool(SigSpec a);
 

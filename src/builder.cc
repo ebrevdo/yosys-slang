@@ -39,7 +39,10 @@ std::string RTLILBuilder::new_id(std::string base)
 std::pair<std::string, SigSpec> RTLILBuilder::add_y_wire(int width)
 {
 	std::string id = new_id();
-	return {id, canvas->addWire(id + "y", width)};
+	if (!generated_y)
+		generated_y = canvas->addWire(id + "y", 0);
+	int offset = std::exchange(generated_y->width, generated_y->width + width);
+	return {id, SigSpec(generated_y, offset, width)};
 }
 
 void RTLILBuilder::bless_cell(RTLIL::Cell *cell)
@@ -50,6 +53,21 @@ void RTLILBuilder::bless_cell(RTLIL::Cell *cell)
 		if (!src.empty())
 			cell->attributes[ID::src] = src;
 	}
+}
+
+void RTLILBuilder::finish_binary_cell_batch(IdString op, BinaryCellBatch &batch)
+{
+	batch.a.extend_u0(8);
+	batch.b.extend_u0(8);
+	SigSpec y(generated_y, batch.y_offset, 8);
+	Cell *cell = canvas->addCell(batch.id, op);
+	cell->setPort(ID::A, batch.a);
+	if (op != ID($not))
+		cell->setPort(ID::B, batch.b);
+	cell->setPort(ID::Y, y);
+	cell->fixup_parameters();
+	if (auto source = format_src(batch.source); !source.empty())
+		cell->attributes[ID::src] = source;
 }
 
 SigSpec RTLILBuilder::ReduceBool(SigSpec a)
@@ -160,6 +178,8 @@ SigSpec RTLILBuilder::LogicNot(SigSpec a)
 {
 	if (a.is_fully_const())
 		return RTLIL::const_logic_not(a.as_const(), RTLIL::Const(), false, false, -1);
+	if (a.size() == 1 && staged_source_range_valid)
+		return Unop(ID($not), a, false, 1);
 	auto [id, y] = add_y_wire(1);
 	bless_cell(canvas->addLogicNot(id, a, y));
 	return y;
@@ -398,6 +418,35 @@ SigSpec RTLILBuilder::Biop(
 			return ret;
 		}
 	}
+	if (y_width == 1 && a.size() == 1 && b.size() == 1 && op.in(ID($logic_and), ID($logic_or)))
+		op = op == ID($logic_and) ? ID($and) : ID($or);
+	if (y_width == 1 && a.size() == 1 && b.size() == 1 && op.in(ID($eq), ID($ne)))
+		op = op == ID($eq) ? ID($xnor) : ID($xor);
+
+	// Zero marks a newly inserted cache entry; stored offsets are one-based.
+	int *cached_offset = nullptr;
+	if (op.in(ID($and), ID($or), ID($not), ID($xor), ID($xnor)) && y_width == 1 && a.size() == 1 &&
+			b.size() == 1 && !a_signed && !b_signed && staged_attributes.empty()) {
+		auto [lhs, rhs] = std::minmax({bit_key(a[0]), bit_key(b[0])});
+		cached_offset = &binary_cell_cache[op][{lhs, rhs}];
+		if (*cached_offset)
+			return RTLIL::SigBit(generated_y, *cached_offset - 1);
+		if (staged_source_range_valid) {
+			auto start = staged_source_range.start(), end = staged_source_range.end();
+			auto &batch =
+					binary_cell_batches[{op, start.buffer().getId(), start.offset(), end.offset()}];
+			if (batch.used == 8) {
+				if (!batch.id.empty())
+					finish_binary_cell_batch(op, batch);
+				auto [id, y] = add_y_wire(8);
+				batch = {id, staged_source_range, {}, {}, y[0].offset, 0};
+			}
+			batch.a.append(a[0]);
+			batch.b.append(b[0]);
+			*cached_offset = batch.y_offset + batch.used++ + 1;
+			return RTLIL::SigBit(generated_y, *cached_offset - 1);
+		}
+	}
 
 	int msb_zeroes = 0;
 	if (op == ID($mul) && !a_signed && !b_signed) {
@@ -420,6 +469,8 @@ SigSpec RTLILBuilder::Biop(
 	cell->setParam(RTLIL::ID::Y_WIDTH, y_width - msb_zeroes);
 	cell->setPort(RTLIL::ID::Y, y);
 	bless_cell(cell);
+	if (cached_offset)
+		*cached_offset = y[0].offset + 1;
 	return {SigSpec(RTLIL::S0, msb_zeroes), y};
 }
 
@@ -440,7 +491,9 @@ SigSpec RTLILBuilder::Unop(IdString op, SigSpec a, bool a_signed, int y_width)
 		OP(reduce_bool)
 #undef OP
 	}
-
+	if (op.in(ID($not), ID($logic_not)) && y_width == 1 && a.size() == 1 &&
+			staged_attributes.empty())
+		return Biop(ID($not), a, RTLIL::S0, false, false, 1);
 	auto [id, y] = add_y_wire(y_width);
 	Cell *cell = canvas->addCell(id, op);
 	cell->setPort(RTLIL::ID::A, a);

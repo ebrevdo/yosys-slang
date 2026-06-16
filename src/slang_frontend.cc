@@ -622,7 +622,7 @@ void NetlistContext::add_continuous_driver(VariableBits lhs, RTLIL::SigSpec rhs)
 	}
 
 	register_driven(cl);
-	connect(convert_static(cl), cr);
+	canvas->connect(convert_static(cl), cr);
 }
 
 RTLIL::SigSpec EvalContext::connection_lhs(ast::AssignmentExpression const &assign)
@@ -2422,6 +2422,8 @@ public:
 			netlist.add_diag(diag::GenericTimingUnsyn, sym.getDelay()->sourceRange);
 
 		const ast::AssignmentExpression &expr = sym.getAssignment().as<ast::AssignmentExpression>();
+		// Bound retained diagnostics and other constant-evaluation state to one RHS.
+		netlist.eval.const_.reset();
 		ast_invariant(expr, !expr.timingControl);
 
 		RTLIL::SigSpec rvalue = netlist.eval(expr.right());
@@ -3306,7 +3308,8 @@ NetlistContext::NetlistContext(
 
 NetlistContext::~NetlistContext()
 {
-	// move constructor could have cleared our canvas pointer
+	// Module-producing paths must explicitly flush partial batches before teardown.
+	log_assert(binary_cell_batches.empty());
 	if (canvas) {
 		canvas->fixup_ports();
 		canvas->check();
@@ -3612,6 +3615,9 @@ struct SlangFrontend : Frontend {
 						continue;
 					driver.diagEngine.issue(diags[i]);
 				}
+				for (auto &[key, batch] : netlist.binary_cell_batches)
+					netlist.finish_binary_cell_batch(std::get<0>(key), batch);
+				netlist.binary_cell_batches.clear();
 			}
 
 			if (check_diagnostics(driver.diagEngine, {}, /*last=*/true))
@@ -3856,6 +3862,9 @@ struct TestSlangExprPass : Pass {
 				nfailures++;
 			}
 		}));
+		for (auto &[key, batch] : netlist.binary_cell_batches)
+			netlist.finish_binary_cell_batch(std::get<0>(key), batch);
+		netlist.binary_cell_batches.clear();
 
 		if (!nfailures)
 			log("%d tests passed.\n", ntests);
